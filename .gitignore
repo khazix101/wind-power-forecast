@@ -1,0 +1,19 @@
+# Python cache
+__pycache__/
+
+# Generated outputs
+*.csv
+*.pth
+*.png
+*.npz
+*.npy
+
+# ETL output directory
+data/wind_nc/output/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
