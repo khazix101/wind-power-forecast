@@ -14,14 +14,14 @@ Input: (batch, 120h, 12 维)
 
 Path A — CNN-LSTM（短时预测，h=1~8）：
   (B, 120, 8) → Conv1D(8→128, k=3, ReLU) → Conv1D(128→192, k=3, ReLU)
-  → MaxPool(2) → LSTM(192→32, 1层, DO=0.31) → FC(32→8)
+  → MaxPool(2) → LSTM(192→32, 1层, DO=0.14) → FC(32→8)
 
 Path B — VMD-LSTM（中长时预测，h=9~24）：
   IMF1+IMF2 → Trend LSTM(128, 1层) → FC(128→64) → DO(0.444) → FC(64→16)
   IMF3+IMF4 → Fluct LSTM(64, 1层)  → FC(64→64)  → DO(0.444) → FC(64→16)
   Sum → (B, 16)
 
-输出：Concat[PathA(8), PathB(16)] → clamp[0, 2000] → (B, 24)
+输出：Concat[PathA(8), PathB(16)] → (B, 24)
 ```
 
 ### 输入特征明细
@@ -70,8 +70,6 @@ Path B — VMD-LSTM（中长时预测，h=9~24）：
                                   │
                                Concat
                                   │
-                               clamp[0, 2000]
-                                  │
                                   ▼
                            24h 风电功率曲线
 ```
@@ -106,7 +104,7 @@ Path B — VMD-LSTM（中长时预测，h=9~24）：
 | VMD 带宽惩罚            | **α=500**                                   | 平衡频带分离（寻优后）           |
 | CNN Conv1D 滤波器      | 128 → 192                                   | 2 层，k=3，ReLU（寻优后）     |
 | CNN-LSTM 隐藏单元       | 32                                          | 1 层（寻优后）              |
-| Path A Dropout      | 0.31                                        | CNN-LSTM FC 层（寻优后）    |
+| Path A Dropout      | 0.14                                        | CNN-LSTM FC 层（贝叶斯寻优后）  |
 | Trend LSTM 隐藏单元     | **128**                                     | 1 层，DO=0.444         |
 | Fluct LSTM 隐藏单元     | **64**                                      | 1 层，DO=0.444         |
 | FC 隐藏单元             | **64**                                      | ReLU + Dropout(0.444) |
@@ -120,6 +118,7 @@ Path B — VMD-LSTM（中长时预测，h=9~24）：
 | 早停                  | patience=30                                 |                       |
 | 批大小                 | 64                                          |                       |
 | 归一化                 | StandardScaler（fit train only）             |                       |
+| 可复现性                | seed=42 + torch.use_deterministic_algorithms(True) |                  |
 | 总参数量                | **~206,000**                                |                       |
 
 ---
@@ -132,15 +131,15 @@ Path B — VMD-LSTM（中长时预测，h=9~24）：
 
 | 指标        | 值             |
 | --------- | ------------- |
-| **MAE**   | **259.05 kW** |
-| **RMSE**  | **368.73 kW** |
+| **MAE**   | **258.94 kW** |
+| **RMSE**  | **368.79 kW** |
 | **NMAE**  | **12.95%**    |
 | **NRMSE** | **18.44%**    |
-| **R2**    | **0.4315**    |
+| **R²**    | **0.4313**    |
 
 #### 分小时表现
 
-| 提前量          | MAE (kW)  | R2         | 负责路径     |
+| 提前量          | MAE (kW)  | R²         | 负责路径     |
 | ------------ | --------- | ---------- | -------- |
 | **h=1**（最近）  | **98.6**  | **0.8855** | CNN-LSTM |
 | h=4          | 202.9     | 0.5682     | CNN-LSTM |
@@ -159,9 +158,24 @@ Path B — VMD-LSTM（中长时预测，h=9~24）：
 
 ---
 
-## 五、关键设计分析与超参数寻优
+## 五、对比实验（Pure LSTM Baseline）
 
-### 5.1 分界线寻优（A_B_hours/）
+运行 `baseline_lstm.py` 进行纯 LSTM 基线对比，量化 VMD 分解 + CNN 双路径架构的实际增益。
+
+| 指标 | Pure LSTM | VMD-Hybrid | 提升 |
+|------|-----------|------------|------|
+| **MAE** | 294.30 kW | **258.94 kW** | **-35.4 kW** |
+| **RMSE** | 426.37 kW | **368.79 kW** | **-57.6 kW** |
+| **R²** | 0.2399 | **0.4313** | **+0.19** |
+| NMAE | 14.72% | **12.95%** | - |
+
+**结论**：VMD 混合架构相比纯 LSTM 有显著提升，尤其是中长时预测。纯 LSTM 的 h=24 R² 仅 0.02，VMD-Hybrid 提升至 0.25——VMD 分解有效缓解了误差累积问题。
+
+---
+
+## 六、关键设计分析与超参数寻优
+
+### 6.1 分界线寻优（A_B_hours/）
 
 对 cnn_out ∈ {4,6,8,10,12,14,16,18,20,22} 进行网格搜索，固定最优 VMD 和 Path A 参数。
 
@@ -174,7 +188,7 @@ Path B — VMD-LSTM（中长时预测，h=9~24）：
 
 **结论**：分界线在 h=8 附近最优。CNN-LSTM 适合 8h 内短时预测，VMD-LSTM 适合 9h 后中长时预测。CNN 覆盖太多小时反而拖累整体。
 
-### 5.2 VMD 超参数寻优
+### 6.2 VMD 超参数寻优
 
 在 `VMD_Hyperparameter_Tuning/` 中开展 60 轮随机搜索（6 个参数），alpha 覆盖 {500,1000,2000,4000,8000}。
 
@@ -194,7 +208,7 @@ Path B — VMD-LSTM（中长时预测，h=9~24）：
 - 所有 alpha=500 的试验都在 epoch 1 收敛，进一步训练验证集损失上升
 - **总参数从初始 1.7M 降至 206K**
 
-### 5.3 Path A 超参数寻优
+### 6.3 Path A 超参数寻优（CNN 随机搜索）
 
 在 `CNN_Hyperparameter_Tuning/` 中开展 30 轮随机搜索（5 个参数）。
 
@@ -206,11 +220,12 @@ Path B — VMD-LSTM（中长时预测，h=9~24）：
 | cnn_lstm_layers | {1, 2} | **1** |
 | path_a_dropout | [0.1, 0.5] | **0.31** |
 
-### 5.4 Dropout + Warmup 贝叶斯优化
+### 6.4 Dropout + Warmup 贝叶斯优化
 
 在 `Dropout_Warmup_Tuning/` 中开展 Gaussian Process + Expected Improvement 贝叶斯优化（50 轮, 7 个参数）。
 
 **关键发现**：
+- path_a_dropout 进一步优化为 **0.14**（替代 CNN 随机搜索的 0.31）
 - **LR=1e-5 + weight_decay=9e-3** 能让模型训练 72 epoch 不崩（验证集视角）
 - 但该配置在测试集上表现更差（MAE=329, R²=0.19），因为验证集（2025.10-12）与测试集（2026）分布差异大
 - **高 LR=5e-4 的 epoch-1 模型是实证最优**：大步更新恰好跳到泛化更好的位置
@@ -218,7 +233,7 @@ Path B — VMD-LSTM（中长时预测，h=9~24）：
 
 ---
 
-## 六、已知限制
+## 七、已知限制
 
 1. **epoch-1 收敛**：模型在 epoch 1 即达验证集最优，进一步训练过拟合。原因：(a) alpha=500 的 VMD IMFs 信息量大, (b) 验证集小（2,208 条）且与测试集分布不匹配
 2. **验证/测试分布差异**：验证集（2025.10-12）仅有 3 个月数据，不足以代表 2026 全年测试集。任何基于验证集做的超参数微调都可能损害测试泛化性
@@ -234,22 +249,38 @@ Path B — VMD-LSTM（中长时预测，h=9~24）：
 
 ---
 
-## 评估图表
-
-运行以下命令生成：
+## 八、运行命令
 
 ```powershell
-# 从项目根目录
-python forecast_tsp\forecast_vmd_hybrid.py     # 训练 + 预测 + 基础图表
-python forecast_tsp\evaluate_vmd_hybrid.py     # 评估仪表盘
+# 0. 生成 wind_data.csv（首次使用）
+cd data/wind_nc
+python nc2wind_csv.py
+
+# 1. 训练 VMD-LSTM 混合模型（从项目根目录）
+cd ../..
+python forecast_tsp/forecast_vmd_hybrid.py
+
+# 2. 生成评估仪表盘
+python forecast_tsp/evaluate_vmd_hybrid.py
+
+# 3. 运行纯 LSTM 基线对比
+python forecast_tsp/baseline_lstm.py
 ```
 
-| 文件                             | 内容                                               |
-| ------------------------------ | ------------------------------------------------ |
-| `vmd_hybrid_results.png`       | 分小时误差曲线 + R2 柱状图 + 样本 24h 剖面 + 散点图 + 残差分布 + 功率曲线 |
-| `vmd_decomposition.png`        | 原始功率 + 4 个 IMF 分解可视化（展示 train domain 前 2000h）       |
-| `vmd_evaluation_dashboard.png` | 评估仪表盘（误差、R2、散点、残差）                               |
-| `vmd_evaluation_profiles.png`  | 样本预测剖面 + 功率曲线 + 指标汇总表                            |
-| `vmd_hybrid_predictions.csv`   | 24h 预测结果 CSV                                     |
-| `vmd_imfs.npz`                 | VMD 分解结果存档（含 train/val/test domain omega）         |
-| `vmd_hybrid.pth`               | 最佳模型权重                                           |
+## 输出文件说明
+
+所有生成文件位于 `outputs/` 目录：
+
+| 文件 | 内容 |
+| --- | --- |
+| `vmd_hybrid_results.png` | 分小时误差曲线 + R² 柱状图 + 样本 24h 剖面 + 散点图 + 残差分布 + 功率曲线 |
+| `vmd_decomposition.png` | 原始功率 + 4 个 IMF 分解可视化（展示 train domain 前 2000h） |
+| `vmd_evaluation_dashboard.png` | 评估仪表盘（误差、R²、散点、残差） |
+| `vmd_evaluation_profiles.png` | 样本预测剖面 + 功率曲线 + 指标汇总表 |
+| `baseline_vs_hybrid.png` | 纯 LSTM vs VMD-Hybrid 对比图 |
+| `vmd_hybrid_predictions.csv` | VMD-Hybrid 24h 预测结果 CSV |
+| `baseline_lstm_predictions.csv` | 纯 LSTM 24h 预测结果 CSV |
+| `vmd_imfs.npz` | VMD 分解结果存档（含 train/val/test domain omega） |
+| `vmd_hybrid.pth` | VMD-Hybrid 最佳模型权重 |
+| `baseline_lstm.pth` | 纯 LSTM 最佳模型权重 |
+| `vmd_cache/` | VMD 分解缓存（分域独立，可复现） |
