@@ -50,7 +50,7 @@ def per_horizon_metrics(y_true, y_pred):
 
 
 def load_eval_data():
-    df = pd.read_csv("../data/wind_nc/output/wind_data.csv")
+    df = pd.read_csv("data/wind_nc/output/wind_data.csv")
     df["valid_time"] = pd.to_datetime(df["valid_time"])
     df = df[df["point_id"] == 1].sort_values("valid_time").reset_index(drop=True)
 
@@ -63,7 +63,7 @@ def load_eval_data():
         df_shifted[f"ws_t{h}"] = df["wind_speed_100m"].shift(-h)
     df_shifted = df_shifted.dropna().reset_index(drop=True)
 
-    pred_path = "vmd_hybrid_predictions.csv"
+    pred_path = os.path.join("outputs", "vmd_hybrid_predictions.csv")
     if not os.path.exists(pred_path):
         print(f"  [WARN] {pred_path} not found. Run forecast_vmd_hybrid.py first.")
         return None, None, None
@@ -146,9 +146,9 @@ def main():
     ax.legend(fontsize=8)
 
     plt.tight_layout()
-    plt.savefig("vmd_evaluation_dashboard.png", dpi=180, bbox_inches="tight")
+    plt.savefig(os.path.join("outputs", "vmd_evaluation_dashboard.png"), dpi=180, bbox_inches="tight")
     plt.close()
-    print("  Saved -> vmd_evaluation_dashboard.png")
+    print("  Saved -> outputs/vmd_evaluation_dashboard.png")
 
     # ── Figure 2: Sample profiles + power curve + metrics table ──
     fig, axes = plt.subplots(1, 3, figsize=(20, 6))
@@ -201,9 +201,9 @@ def main():
     ax.set_title("Metrics Summary", fontsize=13, fontweight="bold")
 
     plt.tight_layout()
-    plt.savefig("vmd_evaluation_profiles.png", dpi=180, bbox_inches="tight")
+    plt.savefig(os.path.join("outputs", "vmd_evaluation_profiles.png"), dpi=180, bbox_inches="tight")
     plt.close()
-    print("  Saved -> vmd_evaluation_profiles.png")
+    print("  Saved -> outputs/vmd_evaluation_profiles.png")
 
     print("\nDone.")
 

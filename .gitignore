@@ -1,24 +1,13 @@
 # Generated data (large, regeneratable)
 data/wind_nc/*.nc
-data/wind_nc/output/wind_data.csv
 
-# Model weights
-*.pth
-
-# Generated results
-*.csv
-vmd_imfs.npz
-
-# Generated plots
-*.png
+# Generated outputs
+outputs/
 
 # Python cache
 __pycache__/
 *.pyc
 *.pyo
-
-# VMD cache
-vmd_cache/
 
 # Personal notes
 自留cg/

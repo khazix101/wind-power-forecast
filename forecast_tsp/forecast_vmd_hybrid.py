@@ -45,6 +45,7 @@ WEATHER_DIM = 8
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
+torch.use_deterministic_algorithms(True)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -187,7 +188,7 @@ def compute_power(v100, rho, rho_ref=1.225):
 # ═══════════════════════════════════════════════════════════
 # 3. Load & prepare data
 # ═══════════════════════════════════════════════════════════
-df = pd.read_csv("data\wind_nc\output\wind_data.csv")
+df = pd.read_csv("data/wind_nc/output/wind_data.csv")
 df["valid_time"] = pd.to_datetime(df["valid_time"])
 df = df[df["point_id"] == 1].sort_values("valid_time").reset_index(drop=True)
 
@@ -231,9 +232,12 @@ domain_train_mask = sample_years.isin([2024, 2025]) & ~((sample_years == 2025) &
 domain_val_mask   = (sample_years == 2025) & (sample_months >= 10)
 domain_test_mask  = sample_years == 2026
 
+OUTPUT_DIR = "outputs"
+VMD_CACHE = os.path.join(OUTPUT_DIR, "vmd_cache")
+os.makedirs(VMD_CACHE, exist_ok=True)
+
 print(f"\n[VMD] Domain-separated decomposition (alpha=500, K=4) ...")
 t0 = time.time()
-VMD_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vmd_cache")
 imfs, omegas = decompose_by_domain(
     power_raw,
     [("train", domain_train_mask),
@@ -319,7 +323,7 @@ model = train_model(
     model, train_loader, val_loader, DEVICE,
     epochs=EPOCHS, lr=LR, patience=PATIENCE,
     weight_decay=WEIGHT_DECAY,
-    model_path="vmd_hybrid.pth",
+    model_path=os.path.join(OUTPUT_DIR, "vmd_hybrid.pth"),
 )
 
 # ═══════════════════════════════════════════════════════════
@@ -352,12 +356,12 @@ pred_out = pd.DataFrame(columns=col_names)
 pred_out["valid_time"] = test_times
 for h in range(OUTPUT_DIM):
     pred_out[f"power_h{h+1}"] = y_pred[:, h]
-pred_out.to_csv("vmd_hybrid_predictions.csv", index=False)
-print(f"  Saved -> vmd_hybrid_predictions.csv")
+pred_out.to_csv(os.path.join(OUTPUT_DIR, "vmd_hybrid_predictions.csv"), index=False)
+print(f"  Saved -> outputs/vmd_hybrid_predictions.csv")
 
-np.savez("vmd_imfs.npz", imfs=imfs, omega_train=omegas["train"],
+np.savez(os.path.join(OUTPUT_DIR, "vmd_imfs.npz"), imfs=imfs, omega_train=omegas["train"],
          omega_val=omegas["val"], omega_test=omegas["test"])
-print(f"  Saved -> vmd_imfs.npz")
+print(f"  Saved -> outputs/vmd_imfs.npz")
 
 # ═══════════════════════════════════════════════════════════
 # 9. Plots
@@ -430,9 +434,9 @@ ax.set_xlabel("Wind Speed 100m (m/s)"); ax.set_ylabel("Power (kW)")
 ax.set_title("Power Curve + Test Labels"); ax.legend(fontsize=7)
 
 plt.tight_layout()
-plt.savefig("vmd_hybrid_results.png", dpi=150, bbox_inches="tight")
+plt.savefig(os.path.join(OUTPUT_DIR, "vmd_hybrid_results.png"), dpi=150, bbox_inches="tight")
 plt.close()
-print("  Plot saved -> vmd_hybrid_results.png")
+print("  Plot saved -> outputs/vmd_hybrid_results.png")
 
 # ── IMF decomposition visualisation ──
 fig2, axes2 = plt.subplots(5, 1, figsize=(18, 12), sharex=True)
@@ -449,8 +453,8 @@ for k in range(4):
     axes2[k + 1].set_title(f"IMF {k + 1}  (omega_train={omegas['train'][k]:.4f})")
 axes2[-1].set_xlabel("Time index (hours)")
 plt.tight_layout()
-plt.savefig("vmd_decomposition.png", dpi=120, bbox_inches="tight")
+plt.savefig(os.path.join(OUTPUT_DIR, "vmd_decomposition.png"), dpi=120, bbox_inches="tight")
 plt.close()
-print("  Plot saved -> vmd_decomposition.png")
+print("  Plot saved -> outputs/vmd_decomposition.png")
 
 print("\nDone.")
