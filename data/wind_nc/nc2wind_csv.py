@@ -4,7 +4,7 @@ import xarray as xr
 import pandas as pd
 import numpy as np
 
-def era5_instant_to_wind_csv(nc_paths=None, output_csv="data\wind_nc\output\wind_data.csv"):
+def era5_instant_to_wind_csv(nc_paths=None, output_csv="data/wind_nc/output/wind_data.csv"):
     """
     从多个 ERA5 instant.nc 文件提取风电变量，合并导出到一个 CSV
     自动计算风速、温度转摄氏度、空气密度
@@ -21,7 +21,7 @@ def era5_instant_to_wind_csv(nc_paths=None, output_csv="data\wind_nc\output\wind
 
     # ===================== 自动发现所有 .nc 文件 =====================
     if nc_paths is None:
-        nc_paths = sorted(py_glob.glob("data\wind_nc\*.nc"))
+        nc_paths = sorted(py_glob.glob("data/wind_nc/*.nc"))
     if not nc_paths:
         print("错误：未找到任何 .nc 文件")
         return None

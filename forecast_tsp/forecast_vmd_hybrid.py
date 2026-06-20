@@ -187,7 +187,7 @@ def compute_power(v100, rho, rho_ref=1.225):
 # ═══════════════════════════════════════════════════════════
 # 3. Load & prepare data
 # ═══════════════════════════════════════════════════════════
-df = pd.read_csv("data\wind_nc\output\wind_data.csv")
+df = pd.read_csv("data/wind_nc/output/wind_data.csv")
 df["valid_time"] = pd.to_datetime(df["valid_time"])
 df = df[df["point_id"] == 1].sort_values("valid_time").reset_index(drop=True)
 
