@@ -9,12 +9,18 @@ from sklearn.metrics import mean_squared_error
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import os, sys, time, json, warnings
+import os, sys, time, warnings
 warnings.filterwarnings("ignore")
 
-sys.path.insert(0, r"D:\net.zero\6.14_wind_forecast_glide\forecast_tsp")
-from vmd_utils import VMDDecomposer, decompose_by_domain
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "forecast_tsp"))
+from vmd_utils import decompose_by_domain
 from vmd_hybrid_model import VMDLSTMHybrid
+from hyper_tune_common import (
+    SEQ_LEN, BATCH_SIZE, OUTPUT_DIM, CAPACITY, WEATHER_DIM, SEED,
+    VMD_CACHE_DIR, WEATHER_COLS,
+    load_wind_data, get_sample_domain_masks, compute_power,
+    clean_path_b_param_defaults,
+)
 
 plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -22,56 +28,27 @@ plt.rcParams["axes.unicode_minus"] = False
 # ══════════════════════════════════════════════
 # Config
 # ══════════════════════════════════════════════
-SEQ_LEN = 120
-BATCH_SIZE = 64
-OUTPUT_DIM = 24
-CNN_OUT = 12
+CNN_OUT = 8  # use same split as final model
 CAPACITY = 2000.0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SEED = 42
 N_TRIALS = 30
 MAX_EPOCHS = 50
 LR = 5e-4
 WEIGHT_DECAY = 5e-4
-WEATHER_DIM = 8
-N_IMFS = 4
 EARLY_STOP_PATIENCE = 10
 
-# Fixed Path B params
-TREND_HIDDEN = 100
-FLUCT_HIDDEN = 128
-N_LAYERS = 2
-PATH_B_DROPOUT = 0.3
+# Fixed Path B params (best from VMD tuning)
+pb = clean_path_b_param_defaults()
+TREND_HIDDEN = pb["trend_hidden"]
+FLUCT_HIDDEN = pb["fluct_hidden"]
+N_LAYERS = pb["n_layers"]
+PATH_B_DROPOUT = pb["path_b_dropout"]
 
-BASE_DIR = r"D:\net.zero\6.14_wind_forecast_glide"
-OUT_DIR = os.path.join(BASE_DIR, "Hyperparameter_Tuning", "CNN_Hyperparameter_Tuning")
-os.makedirs(OUT_DIR, exist_ok=True)
-
-VMD_CACHE_DIR = os.path.join(OUT_DIR, "vmd_cache")
+OUT_DIR = os.path.join(os.path.dirname(__file__))
 os.makedirs(VMD_CACHE_DIR, exist_ok=True)
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
-
-# ══════════════════════════════════════════════
-# Power curve functions
-# ══════════════════════════════════════════════
-def power_curve_v90(v_hub):
-    curve = np.array([
-        [0, 0], [1, 0], [2, 0], [3, 0], [4, 35], [5, 80],
-        [6, 150], [7, 260], [8, 410], [9, 610], [10, 870],
-        [11, 1180], [12, 1540], [13, 1850], [14, 1970],
-        [15, 2000], [16, 2000], [17, 2000], [18, 2000],
-        [19, 2000], [20, 2000], [21, 2000], [22, 2000],
-        [23, 2000], [24, 2000], [25, 2000], [26, 0],
-    ], dtype=float)
-    return np.interp(v_hub, curve[:, 0], curve[:, 1])
-
-def wind_at_hub(v100, z_ref=100, z_hub=90, z0=0.03):
-    return v100 * (np.log(z_hub / z0) / np.log(z_ref / z0))
-
-def compute_power(v100, rho, rho_ref=1.225):
-    return power_curve_v90(wind_at_hub(v100)) * (rho / rho_ref)
 
 # ══════════════════════════════════════════════
 # 1. Load data (once)
@@ -80,50 +57,24 @@ print("=" * 60)
 print("  CNN-LSTM Hyperparameter Tuning — Data Preparation")
 print("=" * 60)
 
-df = pd.read_csv(os.path.join(BASE_DIR, "data", "wind_nc", "output", "wind_data.csv"))
-df["valid_time"] = pd.to_datetime(df["valid_time"])
-df = df[df["point_id"] == 1].sort_values("valid_time").reset_index(drop=True)
-
-# ── 24h power labels ──
-target_cols = []
-for h in range(1, OUTPUT_DIM + 1):
-    col = f"power_t{h}"
-    ws_shifted = df["wind_speed_100m"].shift(-h).values
-    rho_shifted = df["air_density"].shift(-h).values
-    df[col] = compute_power(ws_shifted, rho_shifted)
-    target_cols.append(col)
-df = df.dropna().reset_index(drop=True)
-
-# ── Time encoding ──
-hour = pd.DatetimeIndex(df["valid_time"]).hour
-df["hour_sin"] = np.sin(2 * np.pi * hour / 24)
-df["hour_cos"] = np.cos(2 * np.pi * hour / 24)
-
-# ── Current power ──
-df["power_current"] = compute_power(df["wind_speed_100m"].values, df["air_density"].values)
-
-weather_cols = ["power_current", "wind_speed_100m", "air_density",
-                "u100", "v100", "t2m", "hour_sin", "hour_cos"]
-
+df = load_wind_data()
 times = df["valid_time"].values
 train_years_mask = pd.DatetimeIndex(times).year.isin([2024, 2025])
 
+target_cols = [f"power_t{h}" for h in range(1, OUTPUT_DIM + 1)]
+
 # ══════════════════════════════════════════════
-# 2. VMD decomposition per-domain (no leakage)
+# 2. VMD decomposition per-domain (alpha=500, matching final model)
 # ══════════════════════════════════════════════
 power_raw = df[target_cols].values[:, 0].astype(float)
-sample_years = pd.DatetimeIndex(times).year
-sample_months = pd.DatetimeIndex(times).month
-dom_tr = sample_years.isin([2024, 2025]) & ~((sample_years == 2025) & (sample_months >= 10))
-dom_va = (sample_years == 2025) & (sample_months >= 10)
-dom_te = sample_years == 2026
+dom_tr, dom_va, dom_te = get_sample_domain_masks(times)
 
-print(f"\n[VMD] Domain-separated (alpha=2000) ...")
+print(f"\n[VMD] Domain-separated (alpha=500, shared cache={VMD_CACHE_DIR}) ...")
 t0 = time.time()
 imfs, omegas = decompose_by_domain(
     power_raw,
     [("train", dom_tr), ("val", dom_va), ("test", dom_te)],
-    K=4, alpha=2000, tol=1e-7, max_iter=500, seed=SEED,
+    K=4, alpha=500, tol=1e-7, max_iter=500, seed=SEED,
     cache_dir=VMD_CACHE_DIR,
 )
 print(f"  Done in {time.time()-t0:.1f}s  |  IMFs: {imfs.shape}")
@@ -132,12 +83,11 @@ print(f"  Done in {time.time()-t0:.1f}s  |  IMFs: {imfs.shape}")
 # 3. Scale & build sequences (once)
 # ══════════════════════════════════════════════
 y_raw = df[target_cols].values.astype(np.float32)
-
 scaler_y = StandardScaler()
 scaler_y.fit(y_raw[train_years_mask])
 y_scaled = scaler_y.transform(y_raw)
 
-weather_raw = df[weather_cols].values.astype(np.float32)
+weather_raw = df[WEATHER_COLS].values.astype(np.float32)
 weather_scaler = StandardScaler()
 weather_scaler.fit(weather_raw[train_years_mask])
 weather_scaled = weather_scaler.transform(weather_raw)
@@ -203,13 +153,13 @@ def predict_loader(model, loader, device):
 PARAM_KEYS = ["conv1_filters", "conv2_filters", "cnn_lstm_hidden",
               "cnn_lstm_layers", "path_a_dropout"]
 
-# Pre-computed candidate lists
 conv1_candidates = [32, 48, 64, 96, 128]
 conv2_candidates = [64, 96, 128, 192, 256]
 hidden_candidates = [32, 50, 64, 100, 128]
 
 print(f"\n{'=' * 60}")
 print(f"  Random Search — {N_TRIALS} trials")
+print(f"  CNN_OUT={CNN_OUT}, VMD alpha=500 (matching final model)")
 print(f"  Device: {DEVICE}")
 print(f"{'=' * 60}")
 
@@ -217,7 +167,6 @@ results = []
 next_trial_path = os.path.join(OUT_DIR, "results_partial.csv")
 start_trial = 0
 
-# Resume from partial results
 if os.path.exists(next_trial_path):
     existing = pd.read_csv(next_trial_path)
     results = existing.to_dict("records")
@@ -225,7 +174,6 @@ if os.path.exists(next_trial_path):
     print(f"  Resuming from trial {start_trial + 1}/{N_TRIALS}")
 
 for trial in range(start_trial, N_TRIALS):
-    # Sample hyperparameters
     cf1 = np.random.choice(conv1_candidates)
     cf2 = np.random.choice(conv2_candidates)
     if cf2 <= cf1:
@@ -244,9 +192,9 @@ for trial in range(start_trial, N_TRIALS):
         "n_params": 0,
         "best_epoch": 0,
         "train_time_s": 0,
-        "val_rmse_1to12": 0,
+        "val_rmse_1to8": 0,
         "val_rmse_all": 0,
-        "test_rmse_1to12": 0,
+        "test_rmse_1to8": 0,
         "test_rmse_all": 0,
         "test_mae_all": 0,
     }
@@ -254,9 +202,8 @@ for trial in range(start_trial, N_TRIALS):
     param_desc = f"cf1={cf1} cf2={cf2} h={lstm_h} l={lstm_l} d={p_drop}"
     print(f"\n  Trial {trial+1}/{N_TRIALS} | {param_desc}")
 
-    # Build model (cast int64→int for PyTorch compat)
     model = VMDLSTMHybrid(
-        weather_dim=WEATHER_DIM, n_imfs=N_IMFS, cnn_out=CNN_OUT,
+        weather_dim=WEATHER_DIM, n_imfs=4, cnn_out=CNN_OUT,
         output_dim=OUTPUT_DIM, trend_hidden=TREND_HIDDEN,
         fluct_hidden=FLUCT_HIDDEN, n_layers=N_LAYERS, dropout=PATH_B_DROPOUT,
         capacity=CAPACITY,
@@ -269,18 +216,15 @@ for trial in range(start_trial, N_TRIALS):
     params["n_params"] = n_params
     print(f"         Params: {n_params:,}")
 
-    # Data
     train_loader = DataLoader(SeqDataset(X_train, y_train), BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(SeqDataset(X_val, y_val), BATCH_SIZE)
 
-    # Optimizer & loss
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=5)
     criterion = nn.MSELoss()
 
-    # Training loop
-    best_val_rmse_12 = float("inf")
+    best_val_rmse_8 = float("inf")
     best_model_state = None
     patience_counter = 0
     train_t0 = time.time()
@@ -295,7 +239,6 @@ for trial in range(start_trial, N_TRIALS):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-        # Evaluate
         model.eval()
         val_loss = 0.0
         val_n = 0
@@ -315,11 +258,11 @@ for trial in range(start_trial, N_TRIALS):
         y_true_v = scaler_y.inverse_transform(np.concatenate(all_true, axis=0))
         y_pred_v = np.clip(y_pred_v, 0, CAPACITY)
 
-        rmse_12 = compute_rmse(y_true_v[:, :CNN_OUT], y_pred_v[:, :CNN_OUT])
+        rmse_8 = compute_rmse(y_true_v[:, :CNN_OUT], y_pred_v[:, :CNN_OUT])
         rmse_all = compute_rmse(y_true_v, y_pred_v)
 
-        if rmse_12 < best_val_rmse_12:
-            best_val_rmse_12 = rmse_12
+        if rmse_8 < best_val_rmse_8:
+            best_val_rmse_8 = rmse_8
             patience_counter = 0
             best_model_state = model.state_dict()
             params["best_epoch"] = epoch
@@ -329,7 +272,7 @@ for trial in range(start_trial, N_TRIALS):
                 break
 
     params["train_time_s"] = round(time.time() - train_t0, 1)
-    params["val_rmse_1to12"] = round(float(best_val_rmse_12), 2)
+    params["val_rmse_1to8"] = round(float(best_val_rmse_8), 2)
     params["val_rmse_all"] = round(float(rmse_all), 2)
 
     # Evaluate on test set
@@ -340,28 +283,26 @@ for trial in range(start_trial, N_TRIALS):
     y_pred_t = np.clip(y_pred_t, 0, CAPACITY)
     y_true_t = scaler_y.inverse_transform(y_true_t)
 
-    params["test_rmse_1to12"] = round(float(compute_rmse(y_true_t[:, :CNN_OUT], y_pred_t[:, :CNN_OUT])), 2)
+    params["test_rmse_1to8"] = round(float(compute_rmse(y_true_t[:, :CNN_OUT], y_pred_t[:, :CNN_OUT])), 2)
     params["test_rmse_all"] = round(float(compute_rmse(y_true_t, y_pred_t)), 2)
     params["test_mae_all"] = round(float(np.abs(y_true_t - y_pred_t).mean()), 2)
 
-    print(f"         Val RMSE[1-12]={params['val_rmse_1to12']:.1f}  Test MAE={params['test_mae_all']:.1f}  "
+    print(f"         Val RMSE[1-8]={params['val_rmse_1to8']:.1f}  Test MAE={params['test_mae_all']:.1f}  "
           f"Best epoch={params['best_epoch']}  Time={params['train_time_s']:.0f}s")
 
     results.append(params)
-
-    # Save partial results
     pd.DataFrame(results).to_csv(next_trial_path, index=False)
 
 # ══════════════════════════════════════════════
 # 6. Save & generate plots
 # ══════════════════════════════════════════════
 df_results = pd.DataFrame(results)
-df_results = df_results.sort_values("val_rmse_1to12").reset_index(drop=True)
+df_results = df_results.sort_values("val_rmse_1to8").reset_index(drop=True)
 csv_path = os.path.join(OUT_DIR, "results.csv")
 df_results.to_csv(csv_path, index=False)
 print(f"\n  Results saved -> {csv_path}")
 
-best_idx = df_results["val_rmse_1to12"].idxmin()
+best_idx = df_results["val_rmse_1to8"].idxmin()
 best = df_results.iloc[best_idx]
 
 print(f"\n{'=' * 60}")
@@ -369,24 +310,24 @@ print(f"  BEST TRIAL #{int(best['trial'])}:")
 print(f"    conv1_filters={int(best['conv1_filters'])}, conv2_filters={int(best['conv2_filters'])}")
 print(f"    cnn_lstm_hidden={int(best['cnn_lstm_hidden'])}, cnn_lstm_layers={int(best['cnn_lstm_layers'])}")
 print(f"    path_a_dropout={best['path_a_dropout']:.3f}")
-print(f"    Val RMSE[1-12]={best['val_rmse_1to12']:.1f}  Test MAE={best['test_mae_all']:.1f}")
+print(f"    Val RMSE[1-8]={best['val_rmse_1to8']:.1f}  Test MAE={best['test_mae_all']:.1f}")
 print(f"    Params: {int(best['n_params']):,}")
 print(f"{'=' * 60}")
 
 # ── Plot 1: RMSE vs trial ──
 fig, ax = plt.subplots(figsize=(10, 6))
 trials = df_results["trial"].values
-rmse_vals = df_results["val_rmse_1to12"].values
+rmse_vals = df_results["val_rmse_1to8"].values
 colors = ["#E74C3C" if i == best_idx else "#3498DB" for i in range(len(df_results))]
 ax.scatter(trials, rmse_vals, c=colors, s=50, alpha=0.7, edgecolors="white", linewidth=0.5)
-ax.axhline(best["val_rmse_1to12"], color="#E74C3C", linestyle="--", alpha=0.5,
-           label=f"Best = {best['val_rmse_1to12']:.1f} kW")
-ax.set_xlabel("Trial"); ax.set_ylabel("Val RMSE h=1~12 (kW)")
+ax.axhline(best["val_rmse_1to8"], color="#E74C3C", linestyle="--", alpha=0.5,
+           label=f"Best = {best['val_rmse_1to8']:.1f} kW")
+ax.set_xlabel("Trial"); ax.set_ylabel("Val RMSE h=1~8 (kW)")
 ax.set_title("Random Search — RMSE by Trial"); ax.legend(); ax.grid(True, alpha=0.25)
 plt.tight_layout()
 fig.savefig(os.path.join(OUT_DIR, "rmse_vs_trial.png"), dpi=150); plt.close(fig)
 
-# ── Plot 2: Hyperparameter importance (each param vs RMSE) ──
+# ── Plot 2: Hyperparameter importance ──
 param_names = ["conv1_filters", "conv2_filters", "cnn_lstm_hidden",
                "cnn_lstm_layers", "path_a_dropout"]
 param_labels = ["conv1_filters", "conv2_filters", "cnn_lstm_hidden",
@@ -397,14 +338,12 @@ axes = axes.flatten()
 for i, (pk, pl) in enumerate(zip(param_names, param_labels)):
     ax = axes[i]
     vals = df_results[pk].values
-    r2 = np.corrcoef(vals, df_results["val_rmse_1to12"].values)[0, 1]
+    r2 = np.corrcoef(vals, df_results["val_rmse_1to8"].values)[0, 1]
     ax.scatter(vals, rmse_vals, c="#3498DB", s=30, alpha=0.6, edgecolors="white")
     ax.set_xlabel(pl); ax.set_ylabel("Val RMSE (kW)")
     ax.set_title(f"{pl}  (r={r2:.3f})"); ax.grid(True, alpha=0.2)
     if pk == "cnn_lstm_layers":
         ax.set_xticks([1, 2])
-    elif pk == "path_a_dropout":
-        pass
 fig.delaxes(axes[5])
 plt.tight_layout()
 fig.savefig(os.path.join(OUT_DIR, "param_importance.png"), dpi=150); plt.close(fig)
@@ -413,9 +352,9 @@ fig.savefig(os.path.join(OUT_DIR, "param_importance.png"), dpi=150); plt.close(f
 top5 = df_results.head(5)
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-# Train best model for deep eval and get per-hour metrics
+# Train best model for deep eval
 best_model = VMDLSTMHybrid(
-    weather_dim=WEATHER_DIM, n_imfs=N_IMFS, cnn_out=CNN_OUT,
+    weather_dim=WEATHER_DIM, n_imfs=4, cnn_out=CNN_OUT,
     output_dim=OUTPUT_DIM, trend_hidden=TREND_HIDDEN,
     fluct_hidden=FLUCT_HIDDEN, n_layers=N_LAYERS, dropout=PATH_B_DROPOUT,
     capacity=CAPACITY,
@@ -488,8 +427,8 @@ tbl_data = [
     ["cnn_lstm_layers", str(int(best["cnn_lstm_layers"]))],
     ["path_a_dropout", f"{best['path_a_dropout']:.3f}"],
     ["Total Params", f"{int(best['n_params']):,}"],
-    ["Val RMSE (h=1~12)", f"{best['val_rmse_1to12']:.1f} kW"],
-    ["Test RMSE (h=1~12)", f"{best['test_rmse_1to12']:.1f} kW"],
+    ["Val RMSE (h=1~8)", f"{best['val_rmse_1to8']:.1f} kW"],
+    ["Test RMSE (h=1~8)", f"{best['test_rmse_1to8']:.1f} kW"],
     ["Test MAE (all 24h)", f"{best['test_mae_all']:.1f} kW"],
     ["Best epoch", str(int(best["best_epoch"]))],
 ]
@@ -510,17 +449,16 @@ ax.set_title("Best Trial — Loss Curve"); ax.legend(); ax.grid(True, alpha=0.2)
 plt.tight_layout()
 fig.savefig(os.path.join(OUT_DIR, "best_trial_loss.png"), dpi=150); plt.close(fig)
 
-# ── Plot 5: Parallel coordinates (top 10 highlights) ──
+# ── Plot 5: Parallel coordinates ──
 try:
     from pandas.plotting import parallel_coordinates
     df_plot = df_results.copy()
-    # Normalize params for parallel plot
     for pk in param_names:
         if pk != "cnn_lstm_layers":
             df_plot[pk] = (df_plot[pk] - df_plot[pk].min()) / (df_plot[pk].max() - df_plot[pk].min() + 1e-8)
-    df_plot["rmse_norm"] = (df_plot["val_rmse_1to12"] - df_plot["val_rmse_1to12"].min()) / \
-                           (df_plot["val_rmse_1to12"].max() - df_plot["val_rmse_1to12"].min() + 1e-8)
-    df_plot["rank"] = pd.qcut(df_plot["val_rmse_1to12"], q=3, labels=["Good", "Mid", "Poor"])
+    df_plot["rmse_norm"] = (df_plot["val_rmse_1to8"] - df_plot["val_rmse_1to8"].min()) / \
+                           (df_plot["val_rmse_1to8"].max() - df_plot["val_rmse_1to8"].min() + 1e-8)
+    df_plot["rank"] = pd.qcut(df_plot["val_rmse_1to8"], q=3, labels=["Good", "Mid", "Poor"])
 
     fig, ax = plt.subplots(figsize=(12, 6))
     parallel_coordinates(

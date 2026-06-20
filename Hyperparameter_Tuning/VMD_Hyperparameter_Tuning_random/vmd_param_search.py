@@ -12,9 +12,15 @@ import matplotlib.pyplot as plt
 import os, sys, time, warnings
 warnings.filterwarnings("ignore")
 
-sys.path.insert(0, r"D:\net.zero\6.14_wind_forecast_glide\forecast_tsp")
-from vmd_utils import VMDDecomposer, decompose_by_domain
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "forecast_tsp"))
+from vmd_utils import decompose_by_domain
 from vmd_hybrid_model import VMDLSTMHybrid
+from hyper_tune_common import (
+    SEQ_LEN, BATCH_SIZE, OUTPUT_DIM, CAPACITY, WEATHER_DIM, SEED,
+    VMD_CACHE_DIR, WEATHER_COLS,
+    load_wind_data, get_sample_domain_masks, compute_power,
+    clean_path_a_param_defaults,
+)
 
 plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -37,43 +43,20 @@ WEATHER_DIM = 8
 EARLY_STOP_PATIENCE = 10
 
 # Fixed Path A params (best from CNN tuning)
-CONV1_FILTERS = 128
-CONV2_FILTERS = 192
-CONV_KERNEL = 3
-POOL_SIZE = 2
-CNN_LSTM_HIDDEN = 32
-CNN_LSTM_LAYERS = 1
-PATH_A_DROPOUT = 0.31
+pa = clean_path_a_param_defaults()
+CONV1_FILTERS = pa["conv1_filters"]
+CONV2_FILTERS = pa["conv2_filters"]
+CONV_KERNEL = pa["conv_kernel"]
+POOL_SIZE = pa["pool_size"]
+CNN_LSTM_HIDDEN = pa["cnn_lstm_hidden"]
+CNN_LSTM_LAYERS = pa["cnn_lstm_layers"]
+PATH_A_DROPOUT = pa["path_a_dropout"]
 
-BASE_DIR = r"D:\net.zero\6.14_wind_forecast_glide"
-OUT_DIR = os.path.join(BASE_DIR, "Hyperparameter_Tuning", "VMD_Hyperparameter_Tuning")
-os.makedirs(OUT_DIR, exist_ok=True)
-
-VMD_CACHE_DIR = os.path.join(OUT_DIR, "vmd_cache")
+OUT_DIR = os.path.join(os.path.dirname(__file__))
 os.makedirs(VMD_CACHE_DIR, exist_ok=True)
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
-
-# ══════════════════════════════════════════════
-# Power curve functions
-# ══════════════════════════════════════════════
-def power_curve_v90(v_hub):
-    curve = np.array([
-        [0, 0], [1, 0], [2, 0], [3, 0], [4, 35], [5, 80],
-        [6, 150], [7, 260], [8, 410], [9, 610], [10, 870],
-        [11, 1180], [12, 1540], [13, 1850], [14, 1970],
-        [15, 2000], [16, 2000], [17, 2000], [18, 2000],
-        [19, 2000], [20, 2000], [21, 2000], [22, 2000],
-        [23, 2000], [24, 2000], [25, 2000], [26, 0],
-    ], dtype=float)
-    return np.interp(v_hub, curve[:, 0], curve[:, 1])
-
-def wind_at_hub(v100, z_ref=100, z_hub=90, z0=0.03):
-    return v100 * (np.log(z_hub / z0) / np.log(z_ref / z0))
-
-def compute_power(v100, rho, rho_ref=1.225):
-    return power_curve_v90(wind_at_hub(v100)) * (rho / rho_ref)
 
 # ══════════════════════════════════════════════
 # 1. Load data (once)
@@ -82,37 +65,19 @@ print("=" * 60)
 print("  VMD-LSTM Hyperparameter Tuning — Data Preparation")
 print("=" * 60)
 
-df = pd.read_csv(os.path.join(BASE_DIR, "data", "wind_nc", "output", "wind_data.csv"))
-df["valid_time"] = pd.to_datetime(df["valid_time"])
-df = df[df["point_id"] == 1].sort_values("valid_time").reset_index(drop=True)
-
-target_cols = []
-for h in range(1, OUTPUT_DIM + 1):
-    col = f"power_t{h}"
-    ws_shifted = df["wind_speed_100m"].shift(-h).values
-    rho_shifted = df["air_density"].shift(-h).values
-    df[col] = compute_power(ws_shifted, rho_shifted)
-    target_cols.append(col)
-df = df.dropna().reset_index(drop=True)
-
-hour = pd.DatetimeIndex(df["valid_time"]).hour
-df["hour_sin"] = np.sin(2 * np.pi * hour / 24)
-df["hour_cos"] = np.cos(2 * np.pi * hour / 24)
-df["power_current"] = compute_power(df["wind_speed_100m"].values, df["air_density"].values)
-
-weather_cols = ["power_current", "wind_speed_100m", "air_density",
-                "u100", "v100", "t2m", "hour_sin", "hour_cos"]
-
+df = load_wind_data()
 times = df["valid_time"].values
 train_years_mask = pd.DatetimeIndex(times).year.isin([2024, 2025])
 
-# ── Weather & labels (do once) ──
+target_cols = [f"power_t{h}" for h in range(1, OUTPUT_DIM + 1)]
+
+# ── Scales (do once) ──
 y_raw = df[target_cols].values.astype(np.float32)
 scaler_y = StandardScaler()
 scaler_y.fit(y_raw[train_years_mask])
 y_scaled = scaler_y.transform(y_raw)
 
-weather_raw = df[weather_cols].values.astype(np.float32)
+weather_raw = df[WEATHER_COLS].values.astype(np.float32)
 weather_scaler = StandardScaler()
 weather_scaler.fit(weather_raw[train_years_mask])
 weather_scaled = weather_scaler.transform(weather_raw)
@@ -228,19 +193,15 @@ def train_eval_model(model, X_tr, y_tr, X_va, y_va, X_te, y_te):
     }
 
 # ══════════════════════════════════════════════
-# 3. Pre-compute VMD for each unique alpha (per-domain, no leakage)
+# 3. Pre-compute VMD for each unique alpha (per-domain, shared cache)
 # ══════════════════════════════════════════════
 ALPHA_CANDIDATES = [500, 1000, 2000, 4000, 8000]
 vmd_cache = {}
 
 power_raw = df[target_cols].values[:, 0].astype(float)
-sample_years = pd.DatetimeIndex(times).year
-sample_months = pd.DatetimeIndex(times).month
-dom_tr = sample_years.isin([2024, 2025]) & ~((sample_years == 2025) & (sample_months >= 10))
-dom_va = (sample_years == 2025) & (sample_months >= 10)
-dom_te = sample_years == 2026
+dom_tr, dom_va, dom_te = get_sample_domain_masks(times)
 
-print(f"\n[VMD] Pre-computing {len(ALPHA_CANDIDATES)} alpha values (per-domain) ...")
+print(f"\n[VMD] Pre-computing {len(ALPHA_CANDIDATES)} alpha values (shared cache={VMD_CACHE_DIR}) ...")
 for a in ALPHA_CANDIDATES:
     t0 = time.time()
     imfs, omegas = decompose_by_domain(
@@ -256,7 +217,8 @@ for a in ALPHA_CANDIDATES:
         "imfs_scaled": full_imfs_scaled.astype(np.float32),
         "omegas": omegas,
     }
-    print(f"  alpha={a:5d}  |  {time.time()-t0:.1f}s  |  omegas={ {k: np.round(v,3).tolist() for k,v in omegas.items()} }")
+    print(f"  alpha={a:5d}  |  {time.time()-t0:.1f}s  |  "
+          f"omegas={ {k: np.round(v,3).tolist() for k,v in omegas.items()} }")
 
 # ══════════════════════════════════════════════
 # 4. Random search
@@ -282,7 +244,6 @@ if os.path.exists(partial_path):
     print(f"  Resuming from trial {start_trial + 1}/{N_TRIALS}")
 
 for trial in range(start_trial, N_TRIALS):
-    # Sample params
     a = int(np.random.choice(ALPHA_CANDIDATES))
     th = int(np.random.choice(trend_candidates))
     fh = int(np.random.choice(fluct_candidates))
@@ -318,7 +279,6 @@ for trial in range(start_trial, N_TRIALS):
     X_va, y_va = X_all[val_mask], y_seq[val_mask]
     X_te, y_te = X_all[test_mask], y_seq[test_mask]
 
-    # Build model (Path A fixed, Path B = sampled)
     model = VMDLSTMHybrid(
         weather_dim=WEATHER_DIM, n_imfs=4, cnn_out=CNN_OUT,
         output_dim=OUTPUT_DIM,
@@ -360,7 +320,9 @@ print(f"\n  Results saved -> {csv_path}")
 b = df_res.iloc[0]
 print(f"\n{'=' * 60}")
 print(f"  BEST Trial #{int(b['trial'])}:")
-print(f"    alpha={int(b['alpha'])}, trend_hidden={int(b['trend_hidden'])}, fluct_hidden={int(b['fluct_hidden'])}, n_layers={int(b['n_layers'])}, path_b_dropout={b['path_b_dropout']:.3f}, fc_hidden={int(b['fc_hidden'])}")
+print(f"    alpha={int(b['alpha'])}, trend_hidden={int(b['trend_hidden'])}, "
+      f"fluct_hidden={int(b['fluct_hidden'])}, n_layers={int(b['n_layers'])}, "
+      f"path_b_dropout={b['path_b_dropout']:.3f}, fc_hidden={int(b['fc_hidden'])}")
 print(f"    Val RMSE[17-24]={b['val_rmse_1724']:.1f}  Test MAE={b['test_mae_all']:.1f}  R2={b['test_r2_all']:.3f}")
 print(f"    Params: {int(b['n_params']):,}")
 print(f"{'=' * 60}")
@@ -397,7 +359,6 @@ plt.tight_layout()
 fig.savefig(os.path.join(OUT_DIR, "param_importance.png"), dpi=150); plt.close(fig)
 
 # ── Plot 3: Top 5 comparison + best trial detail ──
-# Retrain best model for per-hour metrics
 best_model = VMDLSTMHybrid(
     weather_dim=WEATHER_DIM, n_imfs=4, cnn_out=CNN_OUT,
     output_dim=OUTPUT_DIM,

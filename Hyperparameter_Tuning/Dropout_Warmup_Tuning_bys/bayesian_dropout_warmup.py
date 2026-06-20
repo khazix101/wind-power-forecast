@@ -20,12 +20,18 @@ from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import os, sys, time, warnings, json
+import os, sys, time, warnings
 warnings.filterwarnings("ignore")
 
-sys.path.insert(0, r"D:\net.zero\6.14_wind_forecast_glide\forecast_tsp")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "forecast_tsp"))
 from vmd_utils import decompose_by_domain
 from vmd_hybrid_model import VMDLSTMHybrid
+from hyper_tune_common import (
+    SEQ_LEN, BATCH_SIZE, OUTPUT_DIM, CAPACITY, WEATHER_DIM, SEED,
+    VMD_CACHE_DIR, WEATHER_COLS,
+    load_wind_data, get_sample_domain_masks, compute_power,
+    clean_path_a_param_defaults, clean_path_b_param_defaults,
+)
 
 plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -44,31 +50,28 @@ WEATHER_DIM = 8
 N_IMFS = 4
 TRIAL_EPOCHS = 80
 PATIENCE = 20
-SCHEDULER_PATIENCE = 10
 
 # Fixed architecture params (from previous optimization)
 VMD_ALPHA = 500
-TREND_HIDDEN = 128
-FLUCT_HIDDEN = 64
-N_LAYERS = 1
-FC_HIDDEN = 64
-CONV1_FILTERS = 128
-CONV2_FILTERS = 192
-CONV_KERNEL = 3
-POOL_SIZE = 2
-CNN_LSTM_HIDDEN = 32
-CNN_LSTM_LAYERS = 1
+pa = clean_path_a_param_defaults()
+pb = clean_path_b_param_defaults()
+TREND_HIDDEN = pb["trend_hidden"]
+FLUCT_HIDDEN = pb["fluct_hidden"]
+N_LAYERS = pb["n_layers"]
+FC_HIDDEN = pb["fc_hidden"]
+CONV1_FILTERS = pa["conv1_filters"]
+CONV2_FILTERS = pa["conv2_filters"]
+CONV_KERNEL = pa["conv_kernel"]
+POOL_SIZE = pa["pool_size"]
+CNN_LSTM_HIDDEN = pa["cnn_lstm_hidden"]
+CNN_LSTM_LAYERS = pa["cnn_lstm_layers"]
 
 # Bayesian optimization settings
 N_INIT = 10          # random initial points
 N_TRIALS = 50        # total GP-guided evaluations
 N_EI_CANDIDATES = 2000  # candidates for EI maximization
 
-BASE_DIR = r"D:\net.zero\6.14_wind_forecast_glide"
-OUT_DIR = os.path.join(BASE_DIR, "Hyperparameter_Tuning", "Dropout_Warmup_Tuning")
-os.makedirs(OUT_DIR, exist_ok=True)
-
-VMD_CACHE_DIR = os.path.join(OUT_DIR, "vmd_cache")
+OUT_DIR = os.path.join(os.path.dirname(__file__))
 os.makedirs(VMD_CACHE_DIR, exist_ok=True)
 
 torch.manual_seed(SEED)
@@ -88,16 +91,14 @@ SPACE = {
 }
 
 def sample_params(rng=None):
-    """Sample one random parameter vector (normalised to [0,1])."""
     if rng is None:
         rng = np.random
     x = np.empty(len(SPACE))
-    for j, (name, spec) in enumerate(SPACE.items()):
+    for j in range(len(SPACE)):
         x[j] = rng.uniform(0, 1)
     return x
 
 def decode_params(x_norm):
-    """Convert normalised [0,1]^D to actual parameter dict."""
     params = {}
     for j, (name, spec) in enumerate(SPACE.items()):
         v_norm = float(np.clip(x_norm[j], 0, 1))
@@ -116,26 +117,6 @@ def decode_params(x_norm):
 
 
 # ══════════════════════════════════════════════
-# Power curve functions
-# ══════════════════════════════════════════════
-def power_curve_v90(v_hub):
-    curve = np.array([
-        [0, 0], [1, 0], [2, 0], [3, 0], [4, 35], [5, 80],
-        [6, 150], [7, 260], [8, 410], [9, 610], [10, 870],
-        [11, 1180], [12, 1540], [13, 1850], [14, 1970],
-        [15, 2000], [16, 2000], [17, 2000], [18, 2000],
-        [19, 2000], [20, 2000], [21, 2000], [22, 2000],
-        [23, 2000], [24, 2000], [25, 2000], [26, 0],
-    ], dtype=float)
-    return np.interp(v_hub, curve[:, 0], curve[:, 1])
-
-def wind_at_hub(v100, z_ref=100, z_hub=90, z0=0.03):
-    return v100 * (np.log(z_hub / z0) / np.log(z_ref / z0))
-
-def compute_power(v100, rho, rho_ref=1.225):
-    return power_curve_v90(wind_at_hub(v100)) * (rho / rho_ref)
-
-# ══════════════════════════════════════════════
 # Data loading (once)
 # ══════════════════════════════════════════════
 print("=" * 60)
@@ -143,28 +124,10 @@ print("  Bayesian Optimization for Dropout & Warmup")
 print(f"  Device: {DEVICE}")
 print("=" * 60)
 
-df = pd.read_csv(os.path.join(BASE_DIR, "data", "wind_nc", "output", "wind_data.csv"))
-df["valid_time"] = pd.to_datetime(df["valid_time"])
-df = df[df["point_id"] == 1].sort_values("valid_time").reset_index(drop=True)
-
-target_cols = []
-for h in range(1, OUTPUT_DIM + 1):
-    col = f"power_t{h}"
-    ws_shifted = df["wind_speed_100m"].shift(-h).values
-    rho_shifted = df["air_density"].shift(-h).values
-    df[col] = compute_power(ws_shifted, rho_shifted)
-    target_cols.append(col)
-df = df.dropna().reset_index(drop=True)
-
-hour = pd.DatetimeIndex(df["valid_time"]).hour
-df["hour_sin"] = np.sin(2 * np.pi * hour / 24)
-df["hour_cos"] = np.cos(2 * np.pi * hour / 24)
-df["power_current"] = compute_power(df["wind_speed_100m"].values, df["air_density"].values)
-
-weather_cols = ["power_current", "wind_speed_100m", "air_density",
-                "u100", "v100", "t2m", "hour_sin", "hour_cos"]
-
+df = load_wind_data()
 times = df["valid_time"].values
+
+target_cols = [f"power_t{h}" for h in range(1, OUTPUT_DIM + 1)]
 
 # ── Labels ──
 y_raw = df[target_cols].values.astype(np.float32)
@@ -174,19 +137,15 @@ scaler_y.fit(y_raw[train_years_mask])
 y_scaled = scaler_y.transform(y_raw)
 
 # ── Weather ──
-weather_raw = df[weather_cols].values.astype(np.float32)
+weather_raw = df[WEATHER_COLS].values.astype(np.float32)
 weather_scaler = StandardScaler()
 weather_scaler.fit(weather_raw[train_years_mask])
 weather_scaled = weather_scaler.transform(weather_raw)
 
-# ── VMD per-domain (no leakage) ──
-sample_years = pd.DatetimeIndex(times).year
-sample_months = pd.DatetimeIndex(times).month
-dom_tr = sample_years.isin([2024, 2025]) & ~((sample_years == 2025) & (sample_months >= 10))
-dom_va = (sample_years == 2025) & (sample_months >= 10)
-dom_te = sample_years == 2026
+# ── VMD per-domain (shared cache) ──
+dom_tr, dom_va, dom_te = get_sample_domain_masks(times)
 
-print(f"\n[VMD] alpha={VMD_ALPHA} per-domain ...")
+print(f"\n[VMD] alpha={VMD_ALPHA} per-domain (shared cache={VMD_CACHE_DIR}) ...")
 t0 = time.time()
 power_raw = df[target_cols].values[:, 0].astype(float)
 imfs, omegas = decompose_by_domain(
@@ -221,7 +180,6 @@ test_mask  = seq_years == 2026
 X_train, y_train = X_all[train_mask], y_all[train_mask]
 X_val,   y_val   = X_all[val_mask],   y_all[val_mask]
 X_test,  y_test  = X_all[test_mask],  y_all[test_mask]
-test_times = seq_times[test_mask]
 
 print(f"  Train={len(X_train)}  Val={len(X_val)}  Test={len(X_test)}\n")
 
@@ -279,7 +237,6 @@ def train_eval(params):
             for pg in optimizer.param_groups:
                 pg["lr"] = lr * wu_frac
 
-        # Train
         model.train()
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
@@ -289,7 +246,6 @@ def train_eval(params):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-        # Validate
         model.eval()
         val_loss = 0.0
         val_n = 0
@@ -321,6 +277,7 @@ def train_eval(params):
     yp_val = np.clip(yp_val, 0, CAPACITY)
     rmse_val = float(np.sqrt(mean_squared_error(yt_val.flatten(), yp_val.flatten())))
 
+    del model
     torch.cuda.empty_cache()
     return rmse_val, best_epoch
 
@@ -329,25 +286,20 @@ def train_eval(params):
 # Bayesian Optimization — GP + EI
 # ══════════════════════════════════════════════
 def expected_improvement(x, gp, y_best, xi=0.01):
-    """Expected Improvement acquisition function."""
     x = np.atleast_2d(x)
     mu, sigma = gp.predict(x, return_std=True)
     sigma = np.maximum(sigma, 1e-9)
-
     with np.errstate(divide="ignore"):
         z = (y_best - mu - xi) / sigma
         ei = (y_best - mu - xi) * sp.stats.norm.cdf(z) + sigma * sp.stats.norm.pdf(z)
         ei[sigma < 1e-9] = 0.0
     return ei
 
-
 def sample_next_point(gp, y_best, n_candidates=N_EI_CANDIDATES):
-    """Maximise EI over random candidates; return (x_norm, ei_value)."""
     X_cand = np.array([sample_params(np.random) for _ in range(n_candidates)])
     ei_vals = expected_improvement(X_cand, gp, y_best)
     best_idx = np.argmax(ei_vals)
     return X_cand[best_idx], float(ei_vals[best_idx])
-
 
 import scipy as sp
 
@@ -356,9 +308,9 @@ print(f"  Bayesian Optimization — {N_INIT} init + {N_TRIALS} trials")
 print(f"  {len(SPACE)} parameters: {list(SPACE.keys())}")
 print("=" * 60)
 
-X_evaluated = []     # normalised parameter vectors
-y_evaluated = []     # val RMSE (kW)
-best_epochs  = []    # best epoch per trial
+X_evaluated = []
+y_evaluated = []
+best_epochs  = []
 results_rows = []
 
 # ── Phase 1: Random initial points ──
@@ -391,7 +343,6 @@ for i in range(N_TRIALS):
     X_arr = np.array(X_evaluated)
     y_arr = np.array(y_evaluated)
 
-    # Fit GP
     kernel = ConstantKernel(1.0) * RBF(length_scale=np.ones(len(SPACE)),
                                          length_scale_bounds=(1e-3, 1e3)) + \
              WhiteKernel(noise_level=1e-2, noise_level_bounds=(1e-5, 1e0))
@@ -399,7 +350,6 @@ for i in range(N_TRIALS):
                                   normalize_y=True, random_state=SEED + i)
     gp.fit(X_arr, y_arr)
 
-    # Find next point via EI maximisation
     y_best = np.min(y_arr)
     x_next, ei_val = sample_next_point(gp, y_best)
     params = decode_params(x_next)
@@ -425,7 +375,6 @@ for i in range(N_TRIALS):
     print(f"  Trial {i+1:2d}/{N_TRIALS} | RMSE={rmse:.1f}  best={best_so_far:.1f}  "
           f"EI={ei_val:.3f}  ep={epoch}  {elapsed:.0f}s  | {desc}")
 
-    # Periodic save
     if (i + 1) % 10 == 0:
         pd.DataFrame(results_rows).to_csv(
             os.path.join(OUT_DIR, "results_partial.csv"), index=False)
