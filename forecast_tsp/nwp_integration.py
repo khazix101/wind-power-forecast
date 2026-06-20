@@ -109,6 +109,9 @@ def build_nwp_features_from_era5(df, vmd_out, cnn_out, nwp_cols=None):
     HRES forecast data. The difference: ERA5 is the "true" historical
     state, so using it as "forecast" creates an upper-bound estimate.
 
+    Returns full-length (N, vmd_out, n_feat) with NaN at the end where
+    shift goes beyond data. Caller should slice and drop NaN.
+
     Parameters
     ----------
     df      : DataFrame with ERA5 data
@@ -117,23 +120,19 @@ def build_nwp_features_from_era5(df, vmd_out, cnn_out, nwp_cols=None):
 
     Returns
     -------
-    nwp_feat : (N, vmd_out, len(nwp_cols)) ndarray or None if cols missing
+    nwp_feat : (N, vmd_out, n_feat) ndarray
+        NaN where shift exceeds data bounds.
     """
     if nwp_cols is None:
         nwp_cols = ["wind_speed_100m", "air_density", "u100", "v100", "t2m"]
 
     N = len(df)
-    available = [c for c in nwp_cols if c in df.columns]
 
     # For each horizon, shift the column forward by that many hours
-    feat = np.zeros((N, vmd_out, len(nwp_cols)), dtype=np.float32)
+    feat = np.full((N, vmd_out, len(nwp_cols)), np.nan, dtype=np.float32)
     for h_idx in range(vmd_out):
         shift = cnn_out + h_idx + 1
         for c_idx, col in enumerate(nwp_cols):
             feat[:, h_idx, c_idx] = df[col].shift(-shift).values
 
-    # Drop rows with NaN (end of series where shift goes beyond data)
-    mask = ~np.any(np.isnan(feat), axis=(1, 2))
-    feat = feat[mask]
-
-    return feat if len(feat) > 0 else None
+    return feat

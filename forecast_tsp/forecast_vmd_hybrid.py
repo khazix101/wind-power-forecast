@@ -22,7 +22,7 @@ import time
 
 from vmd_utils import VMDDecomposer, decompose_by_domain
 from vmd_hybrid_model import VMDLSTMHybrid
-from nwp_integration import build_horizon_cyclic_features
+from nwp_integration import build_nwp_features_from_era5
 
 plt.rcParams["font.sans-serif"] = ["SimHei"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -43,7 +43,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 CNN_OUT = 8
 WEATHER_DIM = 8
-USE_HORIZON_FEAT = True  # per-horizon cyclic features for Path B
+USE_HORIZON_FEAT = True  # per-horizon NWP features for Path B
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
@@ -229,15 +229,18 @@ df["hour_cos"] = np.cos(2 * np.pi * hour / 24)
 # ── Current power (same-timestamp, not a future label) ──
 df["power_current"] = compute_power(df["wind_speed_100m"].values, df["air_density"].values)
 
-# ── Weather features for Path A (CNN-LSTM short term) ──
 weather_cols = ["power_current", "wind_speed_100m", "air_density",
                 "u100", "v100", "t2m", "hour_sin", "hour_cos"]
 
 times = df["valid_time"].values
 
-# ── Per-horizon cyclic features for Path B (deterministic) ──
-# Tells Path B what time of day each future hour corresponds to
-horizon_cyclic_all = build_horizon_cyclic_features(times, OUTPUT_DIM - CNN_OUT, CNN_OUT)
+# ── Pseudo-NWP features for Path B (ERA5 future values as forecast proxy) ──
+# Uses actual future wind_speed, air_density, u100, v100, t2m at each horizon
+# This gives the theoretical upper bound for NWP-aware forecasting
+VMD_OUT = OUTPUT_DIM - CNN_OUT
+NWP_COLS = ["wind_speed_100m", "air_density", "u100", "v100", "t2m"]
+HORIZON_FEAT_DIM = len(NWP_COLS)
+horizon_feat_all = build_nwp_features_from_era5(df, VMD_OUT, CNN_OUT, NWP_COLS)
 print(f"  Total samples (after dropna): {len(df)}")
 print(f"  Time range: {times[0]}  →  {times[-1]}")
 print(f"  Device: {DEVICE}")
@@ -293,13 +296,29 @@ imfs_scaler = StandardScaler()
 imfs_scaler.fit(imfs[domain_train_mask])
 imfs_scaled = imfs_scaler.transform(imfs)
 
+# ── Scale NWP features for Path B (fit on train domain) ──
+N_nwp, H_nwp, F_nwp = horizon_feat_all.shape
+horizon_feat_flat = horizon_feat_all.reshape(N_nwp, -1)
+train_nwp_mask = domain_train_mask  # same length as df horizon_feat_all
+nwp_scaler = StandardScaler()
+nwp_scaler.fit(horizon_feat_flat[train_nwp_mask])
+horizon_feat_scaled = nwp_scaler.transform(horizon_feat_flat).reshape(N_nwp, H_nwp, F_nwp)
+horizon_feat_all = horizon_feat_scaled.astype(np.float32)
+
 # ── Combine weather + IMFs into single feature matrix ──
 features = np.concatenate([weather_scaled, imfs_scaled], axis=1).astype(np.float32)
 
 X_seq, y_seq, idx = create_sequences(features, y_scaled, SEQ_LEN)
 
 # Align horizon features with the sequence index (base time = seq end)
-horizon_cyclic_seq = horizon_cyclic_all[idx]
+horizon_seq = horizon_feat_all[idx]
+
+# Drop sequences where NWP features are NaN (last ~24 rows without future data)
+valid_hf = ~np.any(np.isnan(horizon_seq), axis=(1, 2))
+X_seq = X_seq[valid_hf]
+y_seq = y_seq[valid_hf]
+idx = idx[valid_hf]
+horizon_seq = horizon_seq[valid_hf]
 
 seq_times = times[idx]
 seq_years = pd.DatetimeIndex(seq_times).year
@@ -312,9 +331,9 @@ test_mask  = seq_years == 2026
 X_train, y_train = X_seq[train_mask], y_seq[train_mask]
 X_val,   y_val   = X_seq[val_mask],   y_seq[val_mask]
 X_test,  y_test  = X_seq[test_mask],  y_seq[test_mask]
-hf_train = horizon_cyclic_seq[train_mask]
-hf_val   = horizon_cyclic_seq[val_mask]
-hf_test  = horizon_cyclic_seq[test_mask]
+hf_train = horizon_seq[train_mask]
+hf_val   = horizon_seq[val_mask]
+hf_test  = horizon_seq[test_mask]
 test_times = seq_times[test_mask]
 
 print(f"\n[VMD-Hybrid] Train: {len(X_train)}  Val: {len(X_val)}  Test: {len(X_test)}")
@@ -346,7 +365,7 @@ model = VMDLSTMHybrid(
     path_a_dropout=0.143,
     # NWP / horizon-aware features for Path B
     use_horizon_feat=USE_HORIZON_FEAT,
-    horizon_feat_dim=2,
+    horizon_feat_dim=HORIZON_FEAT_DIM,
 ).to(DEVICE)
 
 train_loader = DataLoader(SequenceDataset(X_train, y_train, hf_train), BATCH_SIZE, shuffle=True)
@@ -362,8 +381,7 @@ model = train_model(
 # ═══════════════════════════════════════════════════════════
 # 7. Evaluate on test set
 # ═══════════════════════════════════════════════════════════
-y_pred_scaled = predict_sequences(model, X_test, BATCH_SIZE, DEVICE,
-                                    hf_test if USE_HORIZON_FEAT else None)
+y_pred_scaled = predict_sequences(model, X_test, BATCH_SIZE, DEVICE, hf_test)
 y_pred = scaler_y.inverse_transform(y_pred_scaled)
 y_pred = np.clip(y_pred, 0, CAPACITY)
 y_true = scaler_y.inverse_transform(y_test)
