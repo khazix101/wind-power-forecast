@@ -45,6 +45,7 @@ WEATHER_DIM = 8
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
+torch.use_deterministic_algorithms(True)
 
 
 # ═══════════════════════════════════════════════════════════
