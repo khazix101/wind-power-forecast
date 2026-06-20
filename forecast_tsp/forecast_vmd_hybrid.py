@@ -22,6 +22,7 @@ import time
 
 from vmd_utils import VMDDecomposer, decompose_by_domain
 from vmd_hybrid_model import VMDLSTMHybrid
+from nwp_integration import build_horizon_cyclic_features
 
 plt.rcParams["font.sans-serif"] = ["SimHei"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -42,6 +43,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 CNN_OUT = 8
 WEATHER_DIM = 8
+USE_HORIZON_FEAT = True  # per-horizon cyclic features for Path B
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
@@ -52,14 +54,19 @@ torch.use_deterministic_algorithms(True)
 # 1. Utilities (inlined from lstm_utils.py)
 # ═══════════════════════════════════════════════════════════
 class SequenceDataset(Dataset):
-    def __init__(self, X, y):
+    def __init__(self, X, y, horizon_features=None):
         self.X = X.astype(np.float32)
         self.y = y.astype(np.float32)
+        self.horizon_features = horizon_features.astype(np.float32) if horizon_features is not None else None
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
+        if self.horizon_features is not None:
+            return (torch.from_numpy(self.X[idx]),
+                    torch.from_numpy(self.y[idx]),
+                    torch.from_numpy(self.horizon_features[idx]))
         return torch.from_numpy(self.X[idx]), torch.from_numpy(self.y[idx])
 
 
@@ -96,12 +103,18 @@ def overall_metrics(y_true, y_pred):
 
 
 @torch.no_grad()
-def predict_sequences(model, X, batch_size, device):
-    loader = DataLoader(TensorDataset(torch.from_numpy(X)), batch_size=batch_size)
+def predict_sequences(model, X, batch_size, device, horizon_features=None):
     preds = []
-    for (x,) in loader:
-        x = x.to(device)
-        preds.append(model(x).cpu().numpy())
+    if horizon_features is not None:
+        hf = torch.from_numpy(horizon_features.astype(np.float32))
+        loader = DataLoader(TensorDataset(torch.from_numpy(X), hf), batch_size=batch_size)
+        for x, hf_batch in loader:
+            x, hf_batch = x.to(device), hf_batch.to(device)
+            preds.append(model(x, hf_batch).cpu().numpy())
+    else:
+        loader = DataLoader(TensorDataset(torch.from_numpy(X)), batch_size=batch_size)
+        for (x,) in loader:
+            preds.append(model(x.to(device)).cpu().numpy())
     return np.concatenate(preds, axis=0)
 
 
@@ -111,12 +124,18 @@ def _run_epoch(model, loader, optimizer, criterion, device, training):
     else:
         model.eval()
     total_loss, n = 0.0, 0
-    for x, y in loader:
+    for batch in loader:
+        if len(batch) == 3:
+            x, y, hf = batch
+            hf = hf.to(device)
+        else:
+            x, y = batch
+            hf = None
         x, y = x.to(device), y.to(device)
         if training:
             optimizer.zero_grad()
         with torch.set_grad_enabled(training):
-            loss = criterion(model(x), y)
+            loss = criterion(model(x, hf), y)
         if training:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -215,6 +234,10 @@ weather_cols = ["power_current", "wind_speed_100m", "air_density",
                 "u100", "v100", "t2m", "hour_sin", "hour_cos"]
 
 times = df["valid_time"].values
+
+# ── Per-horizon cyclic features for Path B (deterministic) ──
+# Tells Path B what time of day each future hour corresponds to
+horizon_cyclic_all = build_horizon_cyclic_features(times, OUTPUT_DIM - CNN_OUT, CNN_OUT)
 print(f"  Total samples (after dropna): {len(df)}")
 print(f"  Time range: {times[0]}  →  {times[-1]}")
 print(f"  Device: {DEVICE}")
@@ -274,6 +297,10 @@ imfs_scaled = imfs_scaler.transform(imfs)
 features = np.concatenate([weather_scaled, imfs_scaled], axis=1).astype(np.float32)
 
 X_seq, y_seq, idx = create_sequences(features, y_scaled, SEQ_LEN)
+
+# Align horizon features with the sequence index (base time = seq end)
+horizon_cyclic_seq = horizon_cyclic_all[idx]
+
 seq_times = times[idx]
 seq_years = pd.DatetimeIndex(seq_times).year
 seq_months = pd.DatetimeIndex(seq_times).month
@@ -285,6 +312,9 @@ test_mask  = seq_years == 2026
 X_train, y_train = X_seq[train_mask], y_seq[train_mask]
 X_val,   y_val   = X_seq[val_mask],   y_seq[val_mask]
 X_test,  y_test  = X_seq[test_mask],  y_seq[test_mask]
+hf_train = horizon_cyclic_seq[train_mask]
+hf_val   = horizon_cyclic_seq[val_mask]
+hf_test  = horizon_cyclic_seq[test_mask]
 test_times = seq_times[test_mask]
 
 print(f"\n[VMD-Hybrid] Train: {len(X_train)}  Val: {len(X_val)}  Test: {len(X_test)}")
@@ -314,10 +344,13 @@ model = VMDLSTMHybrid(
     conv_kernel=3, pool_size=2,
     cnn_lstm_hidden=32, cnn_lstm_layers=1,
     path_a_dropout=0.143,
+    # NWP / horizon-aware features for Path B
+    use_horizon_feat=USE_HORIZON_FEAT,
+    horizon_feat_dim=2,
 ).to(DEVICE)
 
-train_loader = DataLoader(SequenceDataset(X_train, y_train), BATCH_SIZE, shuffle=True)
-val_loader   = DataLoader(SequenceDataset(X_val, y_val), BATCH_SIZE)
+train_loader = DataLoader(SequenceDataset(X_train, y_train, hf_train), BATCH_SIZE, shuffle=True)
+val_loader   = DataLoader(SequenceDataset(X_val, y_val, hf_val), BATCH_SIZE)
 
 model = train_model(
     model, train_loader, val_loader, DEVICE,
@@ -329,7 +362,8 @@ model = train_model(
 # ═══════════════════════════════════════════════════════════
 # 7. Evaluate on test set
 # ═══════════════════════════════════════════════════════════
-y_pred_scaled = predict_sequences(model, X_test, BATCH_SIZE, DEVICE)
+y_pred_scaled = predict_sequences(model, X_test, BATCH_SIZE, DEVICE,
+                                    hf_test if USE_HORIZON_FEAT else None)
 y_pred = scaler_y.inverse_transform(y_pred_scaled)
 y_pred = np.clip(y_pred, 0, CAPACITY)
 y_true = scaler_y.inverse_transform(y_test)

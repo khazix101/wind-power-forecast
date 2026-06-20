@@ -42,12 +42,14 @@ class VMDLSTMHybrid(nn.Module):
                  capacity=2000.0,
                  conv1_filters=64, conv2_filters=128, conv_kernel=3,
                  pool_size=2, cnn_lstm_hidden=50, cnn_lstm_layers=1,
-                 path_a_dropout=0.3):
+                 path_a_dropout=0.3,
+                 use_horizon_feat=False, horizon_feat_dim=2):
         super().__init__()
         self.output_dim = output_dim
         self.cnn_out = cnn_out
         self.vmd_out = output_dim - cnn_out
         self.capacity = capacity
+        self.use_horizon_feat = use_horizon_feat
         pb_drop = dropout if path_b_dropout is None else path_b_dropout
 
         # ── Path A: CNN-LSTM (short horizon, raw + weather features) ──
@@ -85,7 +87,20 @@ class VMDLSTMHybrid(nn.Module):
         self.fluct_drop = nn.Dropout(pb_drop)
         self.fluct_fc2 = nn.Linear(fc_hidden, self.vmd_out)
 
-    def forward(self, x):
+        # ── Path B: Horizon-aware features (NWP / cyclic) ──
+        if use_horizon_feat and horizon_feat_dim > 0:
+            self.horizon_proj = nn.Sequential(
+                nn.Linear(horizon_feat_dim, fc_hidden),
+                nn.ReLU(),
+            )
+            # Learned positional embedding for each output step
+            self.pos_embed = nn.Parameter(
+                torch.randn(1, self.vmd_out, fc_hidden) * 0.02
+            )
+            # Per-step output projection (replaces trend_fc2 / fluct_fc2 when used)
+            self.step_fc = nn.Linear(fc_hidden, 1)
+
+    def forward(self, x, horizon_features=None):
         """Forward pass.
 
         Parameters
@@ -93,6 +108,8 @@ class VMDLSTMHybrid(nn.Module):
         x : (batch, seq_len, weather_dim + n_imfs)
             First weather_dim cols = weather features (Path A).
             Last n_imfs cols = IMF channels (Path B).
+        horizon_features : (batch, vmd_out, feat_dim) or None
+            Per-horizon features for Path B (cyclic or NWP).
 
         Returns
         -------
@@ -119,20 +136,37 @@ class VMDLSTMHybrid(nn.Module):
         imf_low  = x_imfs[:, :, :2]    # (B, T, 2)
         imf_high = x_imfs[:, :, 2:4]   # (B, T, 2)
 
-        t_out, _ = self.trend_lstm(imf_low)     # (B, T, trend_hidden)
-        t_out = t_out[:, -1, :]
-        t_out = torch.relu(self.trend_fc1(t_out))
-        t_out = self.trend_drop(t_out)
-        t_out = self.trend_fc2(t_out)            # (B, vmd_out)
+        t_hid, _ = self.trend_lstm(imf_low)     # (B, T, trend_hidden)
+        t_hid = t_hid[:, -1, :]
+        t_hid = torch.relu(self.trend_fc1(t_hid))
+        t_hid = self.trend_drop(t_hid)           # (B, fc_hidden)
 
-        f_out, _ = self.fluct_lstm(imf_high)    # (B, T, fluct_hidden)
-        f_out = f_out[:, -1, :]
-        f_out = torch.relu(self.fluct_fc1(f_out))
-        f_out = self.fluct_drop(f_out)
-        f_out = self.fluct_fc2(f_out)            # (B, vmd_out)
+        f_hid, _ = self.fluct_lstm(imf_high)    # (B, T, fluct_hidden)
+        f_hid = f_hid[:, -1, :]
+        f_hid = torch.relu(self.fluct_fc1(f_hid))
+        f_hid = self.fluct_drop(f_hid)           # (B, fc_hidden)
 
-        b_out = t_out + f_out                    # (B, vmd_out)
+        if self.use_horizon_feat and horizon_features is not None:
+            # ── Horizon-aware Path B (per-step output) ──
+            # Expand to per-step + add positional embedding
+            t_hid = t_hid.unsqueeze(1) + self.pos_embed   # (B, vmd_out, fc_hidden)
+            f_hid = f_hid.unsqueeze(1) + self.pos_embed   # (B, vmd_out, fc_hidden)
+
+            # Inject per-horizon features (cyclic / NWP)
+            hf = self.horizon_proj(horizon_features)       # (B, vmd_out, fc_hidden)
+            t_hid = t_hid + hf
+            f_hid = f_hid + hf
+
+            # Per-step output projection
+            t_out = self.step_fc(t_hid).squeeze(-1)        # (B, vmd_out)
+            f_out = self.step_fc(f_hid).squeeze(-1)        # (B, vmd_out)
+        else:
+            # ── Original Path B (shared projection) ──
+            t_out = self.trend_fc2(t_hid)                  # (B, vmd_out)
+            f_out = self.fluct_fc2(f_hid)                  # (B, vmd_out)
+
+        b_out = t_out + f_out                              # (B, vmd_out)
 
         # ── Concatenate both paths ──
-        out = torch.cat([a_out, b_out], dim=1)   # (B, cnn_out + vmd_out)
+        out = torch.cat([a_out, b_out], dim=1)              # (B, cnn_out + vmd_out)
         return out
