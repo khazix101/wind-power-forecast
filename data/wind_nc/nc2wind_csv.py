@@ -4,19 +4,11 @@ import xarray as xr
 import pandas as pd
 import numpy as np
 
-def era5_instant_to_wind_csv(nc_paths=None, output_csv="data/wind_nc/output/wind_data.csv",
-                              noise_std=None):
+def era5_instant_to_wind_csv(nc_paths=None, output_csv="data/wind_nc/output/wind_data.csv"):
     """
     从多个 ERA5 instant.nc 文件提取风电变量，合并导出到一个 CSV
     自动计算风速、温度转摄氏度、空气密度
     限定5个指定经纬度 + 时间戳向前8小时 + 编号1-5
-
-    Parameters
-    ----------
-    noise_std : dict or None
-        为各变量添加高斯噪声，格式 {变量名: 标准差}。
-        例如 noise_std={"u100": 0.1, "v100": 0.1, "t2m": 0.5, "sp": 10.0, "blh": 10.0}
-        None 表示不添加噪声。
     """
     # ===================== 固定5个坐标点 =====================
     target_points = {
@@ -65,17 +57,6 @@ def era5_instant_to_wind_csv(nc_paths=None, output_csv="data/wind_nc/output/wind
     # 去除重复行（同一时刻、同一地点出现多次）
     df = df.drop_duplicates(subset=["point_id", "valid_time"]).reset_index(drop=True)
 
-    # ── 在派生计算之前对原始 ERA5 变量添加高斯噪声 ──
-    if noise_std is not None:
-        rng = np.random.default_rng(42)
-        for var, std in noise_std.items():
-            if var in df.columns:
-                noise = rng.normal(0, std, size=len(df))
-                df[var] = df[var] + noise
-                print(f"已对 {var} 添加高斯噪声（std={std}）")
-            else:
-                print(f"警告：变量 {var} 不存在，跳过噪声添加")
-
     # 4. 计算100m风速
     if "u100" in df.columns and "v100" in df.columns:
         df["wind_speed_100m"] = np.sqrt(df["u100"]**2 + df["v100"]**2)
@@ -111,28 +92,6 @@ def era5_instant_to_wind_csv(nc_paths=None, output_csv="data/wind_nc/output/wind
         # 防止异常负值
         df["blh"] = df["blh"].clip(lower=0)
 
-    # ===================== 理论风电功率计算 (Vestas V90-2.0MW) =====================
-    def power_curve_v90(v_hub):
-        curve = np.array([
-            [0, 0], [1, 0], [2, 0], [3, 0], [4, 35], [5, 80],
-            [6, 150], [7, 260], [8, 410], [9, 610], [10, 870],
-            [11, 1180], [12, 1540], [13, 1850], [14, 1970],
-            [15, 2000], [16, 2000], [17, 2000], [18, 2000],
-            [19, 2000], [20, 2000], [21, 2000], [22, 2000],
-            [23, 2000], [24, 2000], [25, 2000], [26, 0],
-        ], dtype=float)
-        return np.interp(v_hub, curve[:, 0], curve[:, 1])
-
-    def wind_at_hub(v100, z_ref=100, z_hub=90, z0=0.03):
-        return v100 * (np.log(z_hub / z0) / np.log(z_ref / z0))
-
-    def compute_power(v100, rho, rho_ref=1.225):
-        return power_curve_v90(wind_at_hub(v100)) * (rho / rho_ref)
-
-    if "wind_speed_100m" in df.columns and "air_density" in df.columns:
-        df["power_kW"] = compute_power(df["wind_speed_100m"].values, df["air_density"].values)
-        print("已计算风电功率 power_kW (Vestas V90-2.0MW)")
-
 
     # ===================== 时间排序 =====================
     df = df.sort_values(
@@ -159,9 +118,7 @@ def era5_instant_to_wind_csv(nc_paths=None, output_csv="data/wind_nc/output/wind
         "air_density",
 
         "blh",
-        "blh_log",
-
-        "power_kW",
+        "blh_log"
     ]
 
     # 只保留实际存在列
@@ -173,7 +130,7 @@ def era5_instant_to_wind_csv(nc_paths=None, output_csv="data/wind_nc/output/wind
     # 8. 导出CSV
     df.to_csv(output_csv, index=False, encoding="utf-8-sig")
 
-    print(f"\n风电数据已成功导出：{output_csv}")
+    print(f"\n🎉 风电数据已成功导出：{output_csv}")
     print(f"数据维度：{df.shape[0]} 行 × {df.shape[1]} 列")
 
     # ===================== 数据概览 =====================
@@ -186,10 +143,4 @@ def era5_instant_to_wind_csv(nc_paths=None, output_csv="data/wind_nc/output/wind
     return df
 
 if __name__ == "__main__":
-    era5_instant_to_wind_csv(noise_std={
-        "u100": 0.1,   # m/s，风速分量噪声
-        "v100": 0.1,   # m/s
-        "t2m": 0.5,    # K，温度噪声
-        "sp": 10.0,    # Pa，气压噪声
-        "blh": 10.0,   # m，边界层高度噪声
-    })
+    era5_instant_to_wind_csv()
