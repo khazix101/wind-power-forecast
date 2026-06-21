@@ -31,16 +31,16 @@ plt.rcParams["axes.unicode_minus"] = False
 # ═══════════════════════════════════════════════════════════
 SEQ_LEN = 120
 BATCH_SIZE = 64
-EPOCHS = 200
-LR = 5e-4
+EPOCHS = 100
+LR = 1.7035e-5
 DROPOUT = 0.3
 PATIENCE = 30
-WEIGHT_DECAY = 5e-4
+WEIGHT_DECAY = 9.7659e-5
 OUTPUT_DIM = 24
 CAPACITY = 2000.0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
-CNN_OUT = 8
+CNN_OUT = 16
 WEATHER_DIM = 8
 
 torch.manual_seed(SEED)
@@ -303,17 +303,17 @@ model = VMDLSTMHybrid(
     cnn_out=CNN_OUT,
     output_dim=OUTPUT_DIM,
     trend_hidden=128,
-    fluct_hidden=64,
+    fluct_hidden=96,
     n_layers=1,
     dropout=DROPOUT,
-    fc_hidden=64,
-    path_b_dropout=0.444,
+    fc_hidden=32,
+    path_b_dropout=0.3936,
     capacity=CAPACITY,
-    # Best Path A hyperparams from random search
-    conv1_filters=128, conv2_filters=192,
+    # Best hyperparams from joint Bayesian search
+    conv1_filters=160, conv2_filters=96,
     conv_kernel=3, pool_size=2,
-    cnn_lstm_hidden=32, cnn_lstm_layers=1,
-    path_a_dropout=0.143,
+    cnn_lstm_hidden=64, cnn_lstm_layers=1,
+    path_a_dropout=0.3879,
 ).to(DEVICE)
 
 train_loader = DataLoader(SequenceDataset(X_train, y_train), BATCH_SIZE, shuffle=True)
