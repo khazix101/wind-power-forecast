@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 import os
 import time
 
-from vmd_utils import VMDDecomposer, decompose_by_domain
+from vmd_utils import VMDDecomposer
 from vmd_hybrid_model import VMDLSTMHybrid
 
 plt.rcParams["font.sans-serif"] = ["SimHei"]
@@ -187,109 +187,130 @@ def compute_power(v100, rho, rho_ref=1.225):
 
 
 # ═══════════════════════════════════════════════════════════
-# 3. Load & prepare data
+# 3. Load & prepare data from domain-separated CSVs
 # ═══════════════════════════════════════════════════════════
-df = pd.read_csv("data/wind_nc/output/wind_data.csv")
-df["valid_time"] = pd.to_datetime(df["valid_time"])
-df = df[df["point_id"] == 1].sort_values("valid_time").reset_index(drop=True)
-
-# ── 24h target power labels ──
-target_cols = []
-for h in range(1, OUTPUT_DIM + 1):
-    col = f"power_t{h}"
-    ws_shifted = df["wind_speed_100m"].shift(-h).values
-    rho_shifted = df["air_density"].shift(-h).values
-    df[col] = compute_power(ws_shifted, rho_shifted)
-    target_cols.append(col)
-df = df.dropna().reset_index(drop=True)
-
-# ── Time encoding features ──
-hour = pd.DatetimeIndex(df["valid_time"]).hour
-df["hour_sin"] = np.sin(2 * np.pi * hour / 24)
-df["hour_cos"] = np.cos(2 * np.pi * hour / 24)
-
-# ── Current power (same-timestamp, not a future label) ──
-df["power_current"] = compute_power(df["wind_speed_100m"].values, df["air_density"].values)
-
-# ── Weather features for Path A (CNN-LSTM short term) ──
-weather_cols = ["power_current", "wind_speed_100m", "air_density",
-                "u100", "v100", "t2m", "hour_sin", "hour_cos"]
-
-times = df["valid_time"].values
-print(f"  Total samples (after dropna): {len(df)}")
-print(f"  Time range: {times[0]}  →  {times[-1]}")
-print(f"  Device: {DEVICE}")
-
-# ═══════════════════════════════════════════════════════════
-# 4. VMD decomposition — per-domain to prevent data leakage
-# ═══════════════════════════════════════════════════════════
-power_raw = df[target_cols].values[:, 0].astype(float)
-train_years_mask = pd.DatetimeIndex(times).year.isin([2024, 2025])
-
-# Build sample-level domain masks (same index space as power_raw)
-sample_years = pd.DatetimeIndex(times).year
-sample_months = pd.DatetimeIndex(times).month
-domain_train_mask = sample_years.isin([2024, 2025]) & ~((sample_years == 2025) & (sample_months >= 10))
-domain_val_mask   = (sample_years == 2025) & (sample_months >= 10)
-domain_test_mask  = sample_years == 2026
-
+DATA_DIR = "data/wind_nc/output"
 OUTPUT_DIR = "outputs"
 VMD_CACHE = os.path.join(OUTPUT_DIR, "vmd_cache")
 os.makedirs(VMD_CACHE, exist_ok=True)
 
+weather_cols = ["power_current", "wind_speed_100m", "air_density",
+                "u100", "v100", "t2m", "hour_sin", "hour_cos"]
+target_cols = [f"power_t{h}" for h in range(1, OUTPUT_DIM + 1)]
+
+def load_domain(name, path):
+    df = pd.read_csv(path)
+    df["valid_time"] = pd.to_datetime(df["valid_time"])
+    df.sort_values("valid_time", inplace=True)
+    hour = pd.DatetimeIndex(df["valid_time"]).hour
+    df["hour_sin"] = np.sin(2 * np.pi * hour / 24)
+    df["hour_cos"] = np.cos(2 * np.pi * hour / 24)
+    df["power_current"] = compute_power(df["wind_speed_100m"].values, df["air_density"].values)
+    for h in range(1, OUTPUT_DIM + 1):
+        df[f"power_t{h}"] = compute_power(
+            df["wind_speed_100m"].shift(-h).values,
+            df["air_density"].shift(-h).values)
+    df.dropna(inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    print(f"  {name}: {len(df)} rows ({df['valid_time'].min()} → {df['valid_time'].max()})")
+    return df
+
+train_df = load_domain("Train", f"{DATA_DIR}/train.csv")
+val_df   = load_domain("Val",   f"{DATA_DIR}/val.csv")
+test_df  = load_domain("Test",  f"{DATA_DIR}/test.csv")
+print(f"  Device: {DEVICE}")
+
+# ═══════════════════════════════════════════════════════════
+# 4. VMD decomposition — per-domain & per-block (val)
+# ═══════════════════════════════════════════════════════════
 print(f"\n[VMD] Domain-separated decomposition (alpha=500, K=4) ...")
 t0 = time.time()
-imfs, omegas = decompose_by_domain(
-    power_raw,
-    [("train", domain_train_mask),
-     ("val",   domain_val_mask),
-     ("test",  domain_test_mask)],
-    K=4, alpha=500, tol=1e-7, max_iter=500, seed=SEED,
-    cache_dir=VMD_CACHE,
-)
-for name, omega in omegas.items():
-    print(f"    {name} omega: {np.round(omega, 4)}")
-print(f"  VMD total: {time.time() - t0:.1f}s  |  IMFs shape: {imfs.shape}")
+
+def run_vmd(name, series):
+    vmd = VMDDecomposer(K=4, alpha=500, tol=1e-7, max_iter=500, seed=SEED,
+                        use_gpu=False, cache_dir=VMD_CACHE, cache_tag=name)
+    imfs = vmd.fit_transform(series)
+    print(f"    {name}: omega={np.round(vmd.omega_, 4)}")
+    return imfs
+
+# Train (single continuous block)
+train_power = train_df[target_cols].values[:, 0].astype(float)
+train_imfs = run_vmd("train", train_power)
+
+# Val (3 independent blocks — detect gaps in valid_time)
+val_power = val_df[target_cols].values[:, 0].astype(float)
+val_times = val_df["valid_time"].values
+val_gaps = np.diff(val_times) > np.timedelta64(1, "h")
+val_block_starts = np.concatenate([[0], np.where(val_gaps)[0] + 1])
+val_imfs_list = []
+for b, start in enumerate(val_block_starts):
+    end = val_block_starts[b + 1] if b + 1 < len(val_block_starts) else len(val_power)
+    block_power = val_power[start:end]
+    imfs = run_vmd(f"val_b{b+1}", block_power)
+    val_imfs_list.append(imfs)
+val_imfs = np.concatenate(val_imfs_list, axis=0)
+
+# Test (single continuous block)
+test_power = test_df[target_cols].values[:, 0].astype(float)
+test_imfs = run_vmd("test", test_power)
+
+print(f"  VMD total: {time.time() - t0:.1f}s")
+print(f"  Train IMFs: {train_imfs.shape}, Val IMFs: {val_imfs.shape}, Test IMFs: {test_imfs.shape}")
 
 # ═══════════════════════════════════════════════════════════
-# 5. Scale & build sequences
+# 5. Scale & build sequences per domain
 # ═══════════════════════════════════════════════════════════
-y_raw = df[target_cols].values.astype(np.float32)
+# ── Weather features ──
+train_weather = train_df[weather_cols].values.astype(np.float32)
+val_weather   = val_df[weather_cols].values.astype(np.float32)
+test_weather  = test_df[weather_cols].values.astype(np.float32)
+
+weather_scaler = StandardScaler()
+weather_scaler.fit(train_weather)
+train_weather_scaled = weather_scaler.transform(train_weather)
+val_weather_scaled   = weather_scaler.transform(val_weather)
+test_weather_scaled  = weather_scaler.transform(test_weather)
+
+# ── Targets ──
+train_y = train_df[target_cols].values.astype(np.float32)
+val_y   = val_df[target_cols].values.astype(np.float32)
+test_y  = test_df[target_cols].values.astype(np.float32)
 
 scaler_y = StandardScaler()
-scaler_y.fit(y_raw[train_years_mask])
-y_scaled = scaler_y.transform(y_raw)
+scaler_y.fit(train_y)
+train_y_scaled = scaler_y.transform(train_y)
+val_y_scaled   = scaler_y.transform(val_y)
+test_y_scaled  = scaler_y.transform(test_y)
 
-# ── Scale weather features (Path A) ──
-weather_raw = df[weather_cols].values.astype(np.float32)
-weather_scaler = StandardScaler()
-weather_scaler.fit(weather_raw[train_years_mask])
-weather_scaled = weather_scaler.transform(weather_raw)
-
-# ── Scale IMFs fit on train domain only ──
+# ── IMFs (scaler fit on train only) ──
 imfs_scaler = StandardScaler()
-imfs_scaler.fit(imfs[domain_train_mask])
-imfs_scaled = imfs_scaler.transform(imfs)
+imfs_scaler.fit(train_imfs)
+train_imfs_scaled = imfs_scaler.transform(train_imfs)
+val_imfs_scaled   = imfs_scaler.transform(val_imfs)
+test_imfs_scaled  = imfs_scaler.transform(test_imfs)
 
-# ── Combine weather + IMFs into single feature matrix ──
-features = np.concatenate([weather_scaled, imfs_scaled], axis=1).astype(np.float32)
+# ── Build sequences per domain ──
+train_features = np.concatenate([train_weather_scaled, train_imfs_scaled], axis=1).astype(np.float32)
+val_features   = np.concatenate([val_weather_scaled,   val_imfs_scaled],   axis=1).astype(np.float32)
+test_features  = np.concatenate([test_weather_scaled,  test_imfs_scaled],  axis=1).astype(np.float32)
 
-X_seq, y_seq, idx = create_sequences(features, y_scaled, SEQ_LEN)
-seq_times = times[idx]
-seq_years = pd.DatetimeIndex(seq_times).year
-seq_months = pd.DatetimeIndex(seq_times).month
+X_train, y_train, _ = create_sequences(train_features, train_y_scaled, SEQ_LEN)
 
-train_mask = seq_years.isin([2024, 2025]) & ~((seq_years == 2025) & (seq_months >= 10))
-val_mask   = (seq_years == 2025) & (seq_months >= 10)
-test_mask  = seq_years == 2026
+# Val: build sequences per block, then concat
+val_X_list, val_y_list = [], []
+for b, start in enumerate(val_block_starts):
+    end = val_block_starts[b + 1] if b + 1 < len(val_block_starts) else len(val_features)
+    Xb, yb, _ = create_sequences(val_features[start:end], val_y_scaled[start:end], SEQ_LEN)
+    val_X_list.append(Xb)
+    val_y_list.append(yb)
+X_val = np.concatenate(val_X_list, axis=0)
+y_val = np.concatenate(val_y_list, axis=0)
 
-X_train, y_train = X_seq[train_mask], y_seq[train_mask]
-X_val,   y_val   = X_seq[val_mask],   y_seq[val_mask]
-X_test,  y_test  = X_seq[test_mask],  y_seq[test_mask]
-test_times = seq_times[test_mask]
+X_test, y_test, test_seq_idx = create_sequences(test_features, test_y_scaled, SEQ_LEN)
+test_times = test_df["valid_time"].values[test_seq_idx]
 
 print(f"\n[VMD-Hybrid] Train: {len(X_train)}  Val: {len(X_val)}  Test: {len(X_test)}")
-print(f"  Feature shape: {features.shape[1]} (weather={WEATHER_DIM} + imfs=4)")
+print(f"  Feature shape: {train_features.shape[1]} (weather={WEATHER_DIM} + imfs=4)")
 
 # ═══════════════════════════════════════════════════════════
 # 6. Train VMD-LSTM Hybrid
@@ -303,14 +324,15 @@ model = VMDLSTMHybrid(
     n_imfs=4,
     cnn_out=CNN_OUT,
     output_dim=OUTPUT_DIM,
+    # VMD params (reverted to previous working config)
     trend_hidden=128,
     fluct_hidden=64,
     n_layers=1,
-    dropout=DROPOUT,
     fc_hidden=64,
     path_b_dropout=0.444,
+    dropout=DROPOUT,
     capacity=CAPACITY,
-    # Best Path A hyperparams from random search
+    # Previous CNN config (conv1=128, conv2=192, dropout=0.143)
     conv1_filters=128, conv2_filters=192,
     conv_kernel=3, pool_size=2,
     cnn_lstm_hidden=32, cnn_lstm_layers=1,
@@ -360,8 +382,8 @@ for h in range(OUTPUT_DIM):
 pred_out.to_csv(os.path.join(OUTPUT_DIR, "vmd_hybrid_predictions.csv"), index=False)
 print(f"  Saved -> outputs/vmd_hybrid_predictions.csv")
 
-np.savez(os.path.join(OUTPUT_DIR, "vmd_imfs.npz"), imfs=imfs, omega_train=omegas["train"],
-         omega_val=omegas["val"], omega_test=omegas["test"])
+np.savez(os.path.join(OUTPUT_DIR, "vmd_imfs.npz"),
+         train_imfs=train_imfs, val_imfs=val_imfs, test_imfs=test_imfs)
 print(f"  Saved -> outputs/vmd_imfs.npz")
 
 # ═══════════════════════════════════════════════════════════
@@ -428,7 +450,7 @@ ws_range = np.linspace(0, 28, 200)
 p_std = power_curve_v90(wind_at_hub(ws_range))
 ax.plot(ws_range, p_std, "b-", linewidth=2.5, label="Ideal curve")
 ax.fill_between(ws_range, p_std * 0.8, p_std * 1.2, alpha=0.08, color="blue")
-ws_test_flat = df["wind_speed_100m"].values[:min(3000, len(y_true) * OUTPUT_DIM)]
+ws_test_flat = test_df["wind_speed_100m"].values[:min(3000, len(y_true) * OUTPUT_DIM)]
 pwr_test_flat = y_true.flatten()[:min(3000, len(y_true) * OUTPUT_DIM)]
 ax.scatter(ws_test_flat[::5], pwr_test_flat[::5], s=3, alpha=0.3, color="red")
 ax.set_xlabel("Wind Speed 100m (m/s)"); ax.set_ylabel("Power (kW)")
@@ -443,15 +465,16 @@ print("  Plot saved -> outputs/vmd_hybrid_results.png")
 fig2, axes2 = plt.subplots(5, 1, figsize=(18, 12), sharex=True)
 fig2.suptitle("VMD Decomposition — Train Domain Power (first 2000 hours)",
               fontsize=14, fontweight="bold")
-n_plot = min(2000, len(power_raw))
+n_plot = min(2000, len(train_power))
 t_plot = np.arange(n_plot)
-axes2[0].plot(t_plot, power_raw[:n_plot], color="black", linewidth=0.8)
+axes2[0].plot(t_plot, train_power[:n_plot], color="black", linewidth=0.8)
 axes2[0].set_ylabel("Power (kW)")
 axes2[0].set_title("Original Power Series")
+train_omega = run_vmd.__wrapped__ if hasattr(run_vmd, '__wrapped__') else None
 for k in range(4):
-    axes2[k + 1].plot(t_plot, imfs[:n_plot, k], linewidth=0.6)
+    axes2[k + 1].plot(t_plot, train_imfs[:n_plot, k], linewidth=0.6)
     axes2[k + 1].set_ylabel(f"IMF {k + 1}")
-    axes2[k + 1].set_title(f"IMF {k + 1}  (omega_train={omegas['train'][k]:.4f})")
+    axes2[k + 1].set_title(f"IMF {k + 1}")
 axes2[-1].set_xlabel("Time index (hours)")
 plt.tight_layout()
 plt.savefig(os.path.join(OUTPUT_DIR, "vmd_decomposition.png"), dpi=120, bbox_inches="tight")
