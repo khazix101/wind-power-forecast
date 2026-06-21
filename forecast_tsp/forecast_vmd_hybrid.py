@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """VMD-LSTM Hybrid 24h Wind Power Forecasting.
 
 Pipeline:
@@ -40,7 +41,6 @@ OUTPUT_DIM = 24
 CAPACITY = 2000.0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
-CNN_OUT = 8
 WEATHER_DIM = 8
 
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -106,7 +106,7 @@ def predict_sequences(model, X, batch_size, device):
     return np.concatenate(preds, axis=0)
 
 
-def _run_epoch(model, loader, optimizer, criterion, device, training):
+def _run_epoch(model, loader, optimizer, criterion, device, training, weighted_fn=None):
     if training:
         model.train()
     else:
@@ -117,7 +117,8 @@ def _run_epoch(model, loader, optimizer, criterion, device, training):
         if training:
             optimizer.zero_grad()
         with torch.set_grad_enabled(training):
-            loss = criterion(model(x), y)
+            pred = model(x)
+            loss = weighted_fn(pred, y, x) if weighted_fn else criterion(pred, y)
         if training:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -129,19 +130,40 @@ def _run_epoch(model, loader, optimizer, criterion, device, training):
 
 def train_model(model, train_loader, val_loader, device,
                 epochs=150, lr=1e-4, patience=20, weight_decay=5e-4,
-                model_path="model.pth"):
+                model_path="model.pth", weather_scaler=None):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=10)
-    criterion = nn.MSELoss()
+    base_criterion = nn.MSELoss()
+    use_weighted = weather_scaler is not None
+    if use_weighted:
+        ws_mean = weather_scaler.mean_[1]
+        ws_scale = weather_scaler.scale_[1]
+        v = np.linspace(0, 28, 281)
+        p = power_curve_v90(wind_at_hub(v))
+        dp_ref = torch.from_numpy(np.abs(np.gradient(p, v[1] - v[0])).astype(np.float32)).to(device)
+
+        def weighted_mse(pred, true, x):
+            ws_scaled = x[:, -1, 1]
+            ws_raw = ws_scaled * ws_scale + ws_mean
+            wi = torch.clamp(ws_raw, 0, 27.99)
+            idx = wi.long()
+            frac = wi - idx.float()
+            sensitivity = dp_ref[idx] * (1 - frac) + dp_ref[idx + 1] * frac
+            sensitivity = torch.clamp(sensitivity, min=1.0)
+            w = (1.0 + sensitivity / sensitivity.max()).unsqueeze(-1)
+            return ((pred - true) ** 2 * w).mean()
+
+    criterion = base_criterion
+    weighted_fn = weighted_mse if use_weighted else None
 
     best_val_loss = float("inf")
     patience_counter = 0
     best_epoch = 0
 
     for epoch in range(1, epochs + 1):
-        train_loss = _run_epoch(model, train_loader, optimizer, criterion, device, True)
-        val_loss = _run_epoch(model, val_loader, optimizer, criterion, device, False)
+        train_loss = _run_epoch(model, train_loader, optimizer, criterion, device, True, weighted_fn)
+        val_loss = _run_epoch(model, val_loader, optimizer, criterion, device, False, weighted_fn)
         scheduler.step(val_loss)
 
         if epoch % 20 == 0 or epoch == 1:
@@ -211,7 +233,7 @@ df["hour_cos"] = np.cos(2 * np.pi * hour / 24)
 # ── Current power (same-timestamp, not a future label) ──
 df["power_current"] = compute_power(df["wind_speed_100m"].values, df["air_density"].values)
 
-# ── Weather features for Path A (CNN-LSTM short term) ──
+# ── Weather features ──
 weather_cols = ["power_current", "wind_speed_100m", "air_density",
                 "u100", "v100", "t2m", "hour_sin", "hour_cos"]
 
@@ -295,13 +317,12 @@ print(f"  Feature shape: {features.shape[1]} (weather={WEATHER_DIM} + imfs=4)")
 # 6. Train VMD-LSTM Hybrid
 # ═══════════════════════════════════════════════════════════
 print("\n" + "=" * 60)
-print(f"  CNN-LSTM({CNN_OUT}h) + VMD-LSTM({OUTPUT_DIM - CNN_OUT}h) Hybrid Training")
+print(f"  VMD-LSTM Hybrid (soft fusion) Training")
 print("=" * 60)
 
 model = VMDLSTMHybrid(
     weather_dim=WEATHER_DIM,
     n_imfs=4,
-    cnn_out=CNN_OUT,
     output_dim=OUTPUT_DIM,
     trend_hidden=128,
     fluct_hidden=64,
@@ -325,6 +346,7 @@ model = train_model(
     epochs=EPOCHS, lr=LR, patience=PATIENCE,
     weight_decay=WEIGHT_DECAY,
     model_path=os.path.join(OUTPUT_DIR, "vmd_hybrid.pth"),
+    weather_scaler=weather_scaler,
 )
 
 # ═══════════════════════════════════════════════════════════
@@ -343,11 +365,11 @@ print(f"  Overall  MAE={mae_all:.2f} kW  RMSE={rmse_all:.2f} kW  R2={r2_all:.4f}
 print(f"  NMAE={mae_all / CAPACITY * 100:.2f}%  NRMSE={rmse_all / CAPACITY * 100:.2f}%")
 print(f"  Per-horizon min/mean/max MAE:  {mae_h.min():.1f} / {mae_h.mean():.1f} / {mae_h.max():.1f} kW")
 print(f"  Per-horizon min/mean/max R2:   {r2_h.min():.4f} / {r2_h.mean():.4f} / {r2_h.max():.4f}")
-print(f"  h=1  MAE={mae_h[0]:.1f} kW  R2={r2_h[0]:.4f}  (CNN-LSTM)")
-print(f"  h=4  MAE={mae_h[3]:.1f} kW  R2={r2_h[3]:.4f}  (CNN-LSTM)")
-print(f"  h=6  MAE={mae_h[5]:.1f} kW  R2={r2_h[5]:.4f}  (VMD-LSTM)")
-print(f"  h=12 MAE={mae_h[11]:.1f} kW R2={r2_h[11]:.4f}  (VMD-LSTM)")
-print(f"  h=24 MAE={mae_h[23]:.1f} kW R2={r2_h[23]:.4f}  (VMD-LSTM)")
+print(f"  h=1  MAE={mae_h[0]:.1f} kW  R2={r2_h[0]:.4f}")
+print(f"  h=4  MAE={mae_h[3]:.1f} kW  R2={r2_h[3]:.4f}")
+print(f"  h=6  MAE={mae_h[5]:.1f} kW  R2={r2_h[5]:.4f}")
+print(f"  h=12 MAE={mae_h[11]:.1f} kW R2={r2_h[11]:.4f}")
+print(f"  h=24 MAE={mae_h[23]:.1f} kW R2={r2_h[23]:.4f}")
 
 # ═══════════════════════════════════════════════════════════
 # 8. Save predictions & IMFs
@@ -370,7 +392,7 @@ print(f"  Saved -> outputs/vmd_imfs.npz")
 horizons = np.arange(1, OUTPUT_DIM + 1)
 
 fig, axes = plt.subplots(2, 3, figsize=(22, 13))
-fig.suptitle("CNN-LSTM(1-8h) + VMD-LSTM(9-24h) — 24h Wind Power Forecast", fontsize=15, fontweight="bold")
+fig.suptitle("VMD-LSTM Hybrid (Soft Fusion) — 24h Wind Power Forecast", fontsize=15, fontweight="bold")
 
 # (0,0) Per-horizon error curves
 ax = axes[0, 0]

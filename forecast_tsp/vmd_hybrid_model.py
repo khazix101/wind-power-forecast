@@ -12,41 +12,21 @@ import torch.nn as nn
 
 
 class VMDLSTMHybrid(nn.Module):
-    """CNN-LSTM (short term) + VMD-LSTM (long term) hybrid.
+    """CNN-LSTM (weather) + VMD-LSTM (IMFs) hybrid with learned fusion.
 
-    Parameters
-    ----------
-    weather_dim      : number of weather/raw features in input (default 8)
-    n_imfs           : number of IMF channels in input (default 4)
-    cnn_out          : first N hours predicted by CNN-LSTM path (default 12)
-    output_dim       : total forecast horizon (default 24)
-    trend_hidden     : hidden size for Trend-LSTM path (default 100)
-    fluct_hidden     : hidden size for Fluctuation-LSTM path (default 128)
-    n_layers         : LSTM layers for VMD paths (default 2)
-    dropout          : dropout rate for VMD paths (default 0.3)
-    fc_hidden        : FC hidden layer size for Path B (default 50)
-    path_b_dropout   : dropout for Path B (None → uses dropout) (default None)
-    capacity         : max power (kW) for output clamping (default 2000.0)
-    conv1_filters    : Conv1D layer 1 output channels (default 64)
-    conv2_filters    : Conv1D layer 2 output channels (default 128)
-    conv_kernel      : Conv1D kernel size (default 3)
-    pool_size        : MaxPool1d kernel size (default 2)
-    cnn_lstm_hidden  : hidden size for CNN-LSTM path (default 50)
-    cnn_lstm_layers  : LSTM layers for CNN path (default 1)
-    path_a_dropout   : dropout rate for CNN path FC (default 0.3)
+    Both paths output the full 24h horizon; a learned gate fuses them
+    sample-by-sample and hour-by-hour.
     """
 
-    def __init__(self, weather_dim=8, n_imfs=4, cnn_out=12, output_dim=24,
-                 trend_hidden=100, fluct_hidden=128, n_layers=2,
-                 dropout=0.3, fc_hidden=50, path_b_dropout=None,
+    def __init__(self, weather_dim=8, n_imfs=4, output_dim=24,
+                 trend_hidden=128, fluct_hidden=64, n_layers=1,
+                 dropout=0.3, fc_hidden=64, path_b_dropout=None,
                  capacity=2000.0,
                  conv1_filters=64, conv2_filters=128, conv_kernel=3,
-                 pool_size=2, cnn_lstm_hidden=50, cnn_lstm_layers=1,
+                 pool_size=2, cnn_lstm_hidden=32, cnn_lstm_layers=1,
                  path_a_dropout=0.3):
         super().__init__()
         self.output_dim = output_dim
-        self.cnn_out = cnn_out
-        self.vmd_out = output_dim - cnn_out
         self.capacity = capacity
         pb_drop = dropout if path_b_dropout is None else path_b_dropout
 
@@ -63,7 +43,7 @@ class VMDLSTMHybrid(nn.Module):
             dropout=path_a_dropout if cnn_lstm_layers > 1 else 0.0,
         )
         self.cnn_drop = nn.Dropout(path_a_dropout)
-        self.cnn_fc = nn.Linear(cnn_lstm_hidden, cnn_out)
+        self.cnn_fc = nn.Linear(cnn_lstm_hidden, output_dim)
 
         # ── Path B: Trend-LSTM (IMF 1-2) ──
         self.trend_lstm = nn.LSTM(
@@ -73,7 +53,7 @@ class VMDLSTMHybrid(nn.Module):
         )
         self.trend_fc1 = nn.Linear(trend_hidden, fc_hidden)
         self.trend_drop = nn.Dropout(pb_drop)
-        self.trend_fc2 = nn.Linear(fc_hidden, self.vmd_out)
+        self.trend_fc2 = nn.Linear(fc_hidden, output_dim)
 
         # ── Path B: Fluctuation-LSTM (IMF 3-4) ──
         self.fluct_lstm = nn.LSTM(
@@ -83,7 +63,9 @@ class VMDLSTMHybrid(nn.Module):
         )
         self.fluct_fc1 = nn.Linear(fluct_hidden, fc_hidden)
         self.fluct_drop = nn.Dropout(pb_drop)
-        self.fluct_fc2 = nn.Linear(fc_hidden, self.vmd_out)
+        self.fluct_fc2 = nn.Linear(fc_hidden, output_dim)
+
+        self.gate_fc = nn.Linear(cnn_lstm_hidden + trend_hidden + fluct_hidden, output_dim)
 
     def forward(self, x):
         """Forward pass.
@@ -105,34 +87,30 @@ class VMDLSTMHybrid(nn.Module):
         x_imfs    = x[:, :, weather_dim:]       # (B, T, 4)
 
         # ── Path A: CNN-LSTM ──
-        a = x_weather.permute(0, 2, 1)          # (B, weather_dim, T) for Conv1D
+        a = x_weather.permute(0, 2, 1)          # (B, weather_dim, T)
         a = torch.relu(self.conv1(a))
         a = torch.relu(self.conv2(a))
         a = self.pool(a)
         a = a.permute(0, 2, 1)
         a_out, _ = self.cnn_lstm(a)
-        a_out = a_out[:, -1, :]
-        a_out = self.cnn_drop(a_out)
-        a_out = self.cnn_fc(a_out)
+        a_hidden = a_out[:, -1, :]               # (B, cnn_lstm_hidden)
+        a_pred = self.cnn_fc(self.cnn_drop(a_hidden))  # (B, output_dim)
 
         # ── Path B: Trend-LSTM (IMF 1-2) + Fluctuation-LSTM (IMF 3-4) ──
-        imf_low  = x_imfs[:, :, :2]    # (B, T, 2)
-        imf_high = x_imfs[:, :, 2:4]   # (B, T, 2)
+        imf_low  = x_imfs[:, :, :2]
+        imf_high = x_imfs[:, :, 2:4]
 
-        t_out, _ = self.trend_lstm(imf_low)     # (B, T, trend_hidden)
-        t_out = t_out[:, -1, :]
-        t_out = torch.relu(self.trend_fc1(t_out))
-        t_out = self.trend_drop(t_out)
-        t_out = self.trend_fc2(t_out)            # (B, vmd_out)
+        t_out, _ = self.trend_lstm(imf_low)
+        t_hidden = t_out[:, -1, :]               # (B, trend_hidden)
+        t_pred = self.trend_fc2(self.trend_drop(torch.relu(self.trend_fc1(t_hidden))))
 
-        f_out, _ = self.fluct_lstm(imf_high)    # (B, T, fluct_hidden)
-        f_out = f_out[:, -1, :]
-        f_out = torch.relu(self.fluct_fc1(f_out))
-        f_out = self.fluct_drop(f_out)
-        f_out = self.fluct_fc2(f_out)            # (B, vmd_out)
+        f_out, _ = self.fluct_lstm(imf_high)
+        f_hidden = f_out[:, -1, :]               # (B, fluct_hidden)
+        f_pred = self.fluct_fc2(self.fluct_drop(torch.relu(self.fluct_fc1(f_hidden))))
 
-        b_out = t_out + f_out                    # (B, vmd_out)
+        b_pred = t_pred + f_pred                  # (B, output_dim)
 
-        # ── Concatenate both paths ──
-        out = torch.cat([a_out, b_out], dim=1)   # (B, cnn_out + vmd_out)
+        # ── Learned fusion gate ──
+        gate = torch.sigmoid(self.gate_fc(torch.cat([a_hidden, t_hidden, f_hidden], dim=-1)))
+        out = gate * a_pred + (1 - gate) * b_pred
         return out
