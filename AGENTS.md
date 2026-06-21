@@ -54,11 +54,11 @@ A_B_hours/
 ## Current best results (no data leakage)
 
 ```
-MAE = 259.05 kW   R² = 0.4315
-NMAE = 12.95%     NRMSE = 18.44%
-h=1:  MAE=98.6   R²=0.89   (CNN-LSTM)
-h=12: MAE=266.5  R²=0.44   (VMD-LSTM)
-h=24: MAE=317.9  R²=0.25   (VMD-LSTM)
+MAE = 270.02 kW   R² = 0.3885
+NMAE = 13.50%     NRMSE = 18.89%
+h=1:  MAE=102.9  R²=0.88   (CNN-LSTM)
+h=12: MAE=286.7  R²=0.36   (VMD-LSTM)
+h=24: MAE=323.2  R²=0.23   (VMD-LSTM)
 ```
 
 ## Training config
