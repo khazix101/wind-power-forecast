@@ -43,6 +43,7 @@ SEED = 42
 CNN_OUT = 8
 WEATHER_DIM = 8
 
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 torch.use_deterministic_algorithms(True)
